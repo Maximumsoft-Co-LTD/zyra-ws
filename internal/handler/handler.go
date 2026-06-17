@@ -1,0 +1,113 @@
+package handler
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gorilla/websocket"
+
+	"zyra-ws/internal/auth"
+	"zyra-ws/internal/hub"
+)
+
+// Handler exposes HTTP endpoints for zyra-ws.
+type Handler struct {
+	hub        *hub.Hub
+	tokenKey   string
+	upgrader   websocket.Upgrader
+}
+
+// New creates a Handler.
+// allowedOrigins is the list from config; "*" disables origin check.
+func New(h *hub.Hub, tokenKey string, allowedOrigins []string) *Handler {
+	wildcardAll := len(allowedOrigins) == 1 && allowedOrigins[0] == "*"
+
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			if wildcardAll {
+				return true
+			}
+			origin := r.Header.Get("Origin")
+			for _, allowed := range allowedOrigins {
+				if strings.EqualFold(origin, allowed) {
+					return true
+				}
+			}
+			return false
+		},
+	}
+
+	return &Handler{hub: h, tokenKey: tokenKey, upgrader: upgrader}
+}
+
+// Healthz responds with service status and per-room online counts.
+// GET /healthz
+func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
+	stats := h.hub.Stats()
+	total := 0
+	for _, n := range stats {
+		total += n
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	// Hand-rolled JSON to avoid importing encoding/json for a trivial response.
+	rooms := ""
+	for id, n := range stats {
+		if rooms != "" {
+			rooms += ","
+		}
+		rooms += `"` + id + `":` + itoa(n)
+	}
+	w.Write([]byte(`{"status":"ok","total_online":` + itoa(total) + `,"rooms":{` + rooms + `}}`)) //nolint:errcheck
+}
+
+// Connect upgrades an HTTP request to a WebSocket connection and joins the hub.
+// GET /ws?workspace_id=<id>&token=<jwt>[&avatar_url=<url>]
+func (h *Handler) Connect(w http.ResponseWriter, r *http.Request) {
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
+	tokenStr := strings.TrimSpace(r.URL.Query().Get("token"))
+	avatarURL := strings.TrimSpace(r.URL.Query().Get("avatar_url"))
+
+	if workspaceID == "" {
+		http.Error(w, "workspace_id required", http.StatusBadRequest)
+		return
+	}
+
+	claims, err := auth.ValidateToken(tokenStr, h.tokenKey)
+	if err != nil {
+		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	conn, err := h.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		// Upgrade already wrote the error response; nothing to do.
+		return
+	}
+
+	h.hub.Join(conn, claims.UserID, claims.DisplayName, avatarURL, workspaceID)
+}
+
+// itoa is a tiny int-to-string helper to avoid importing strconv here.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	b := make([]byte, 0, 10)
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
+}

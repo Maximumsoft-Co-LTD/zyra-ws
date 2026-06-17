@@ -1,0 +1,87 @@
+name: Deploy zyra-ws to Cloud Run
+
+on:
+  workflow_run:
+    workflows: ["CI zyra-ws"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  GCP_REGION: asia-southeast1
+  AR_REPO: zyra
+  SERVICE_NAME: zyra-ws
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: zyra-ws
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Build and push image
+        run: |
+          DEPLOY_SHA=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+          IMAGE=${{ env.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/${{ env.AR_REPO }}/ws-preview:${DEPLOY_SHA}
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Write env vars file
+        env:
+          TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
+          ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+        run: |
+          python3 - <<'PY' > env.yaml
+          import os, yaml
+          out = {
+              "tokenKey": os.environ.get("TOKEN_KEY", ""),
+              "ALLOWED_ORIGINS": os.environ.get("ALLOWED_ORIGINS", ""),
+          }
+          print(yaml.safe_dump(out, default_style='"'))
+          PY
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image="$IMAGE" \
+            --region=${{ env.GCP_REGION }} \
+            --platform=managed \
+            --allow-unauthenticated \
+            --min-instances=1 \
+            --max-instances=2 \
+            --timeout=3600 \
+            --cpu=1 \
+            --memory=512Mi \
+            --port=8080 \
+            --env-vars-file=env.yaml
+
+      - name: Show deployed URL
+        run: |
+          gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.GCP_REGION }} --format='value(status.url)'
