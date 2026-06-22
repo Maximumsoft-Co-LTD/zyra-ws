@@ -83,8 +83,6 @@ jobs:
             --port=8080 \
             --session-affinity \
             --cpu-boost \
-            --startup-probe=httpGet.path=/healthz,initialDelaySeconds=3,periodSeconds=5,failureThreshold=6 \
-            --liveness-probe=httpGet.path=/healthz,periodSeconds=30,failureThreshold=3 \
             --env-vars-file=env.yaml
 
       - name: Show deployed URL
