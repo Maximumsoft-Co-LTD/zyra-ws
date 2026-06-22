@@ -49,10 +49,18 @@ func ValidateToken(tokenStr, signingKey string) (Claims, error) {
 		return v
 	}
 
+	name := str("name")
+	if last := str("lastname"); last != "" {
+		name = name + " " + last
+	}
+	if dn := str("display_name"); dn != "" {
+		name = dn
+	}
+
 	return Claims{
-		UserID:      str("user_id"),
+		UserID:      str("id"),
 		Username:    str("username"),
-		DisplayName: str("display_name"),
+		DisplayName: name,
 		Role:        str("role_"),
 	}, nil
 }

@@ -28,21 +28,41 @@ type Client struct {
 	conn *websocket.Conn
 	send chan []byte // buffered outbound messages
 
-	UserID      string
-	DisplayName string
-	AvatarURL   string
-	TileX       int
-	TileY       int
+	UserID        string
+	DisplayName   string
+	CharacterName string
+	AvatarURL     string
+	TileX         int
+	TileY         int
+	PX            float64 // world pixel X (sprite centre) — 0 = not yet set
+	PY            float64 // world pixel Y (sprite centre) — 0 = not yet set
+	Status        string
+	CustomMsg     string
+	RoomID        string
+	Direction     string
+	Sitting       bool
+	// FollowTargetID is the user_id this client is currently following.
+	// Tracked in-memory so the unfollow handler can notify the previous target
+	// without an extra Redis round-trip.
+	FollowTargetID string
 }
 
 // Player converts the client's current state into a Player DTO.
 func (c *Client) Player() Player {
 	return Player{
-		UserID:      c.UserID,
-		DisplayName: c.DisplayName,
-		AvatarURL:   c.AvatarURL,
-		TileX:       c.TileX,
-		TileY:       c.TileY,
+		UserID:        c.UserID,
+		DisplayName:   c.DisplayName,
+		CharacterName: c.CharacterName,
+		AvatarURL:     c.AvatarURL,
+		TileX:         c.TileX,
+		TileY:         c.TileY,
+		PX:            c.PX,
+		PY:            c.PY,
+		Status:        c.Status,
+		CustomMsg:     c.CustomMsg,
+		RoomID:        c.RoomID,
+		Direction:     c.Direction,
+		Sitting:       c.Sitting,
 	}
 }
 
@@ -103,6 +123,14 @@ func (c *Client) ReadPump() {
 		}
 		c.room.handleClientMessage(c, raw)
 	}
+}
+
+// EffectiveName returns the character name if set, otherwise falls back to display name.
+func (c *Client) EffectiveName() string {
+	if c.CharacterName != "" {
+		return c.CharacterName
+	}
+	return c.DisplayName
 }
 
 // Send enqueues a message for the client's write pump.

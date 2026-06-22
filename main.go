@@ -9,9 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
+
 	"zyra-ws/internal/config"
 	"zyra-ws/internal/handler"
 	"zyra-ws/internal/hub"
+	"zyra-ws/internal/store"
 )
 
 func main() {
@@ -19,7 +22,28 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 
-	h := hub.New()
+	// Redis — optional; gracefully degrades to in-memory fallback when absent.
+	var redisStore *store.RedisStore
+	if cfg.RedisURL != "" {
+		opt, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			slog.Warn("invalid REDIS_URL — running without Redis", "error", err)
+		} else {
+			rdb := redis.NewClient(opt)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if pingErr := rdb.Ping(ctx).Err(); pingErr != nil {
+				slog.Warn("Redis ping failed — running without Redis", "error", pingErr)
+			} else {
+				redisStore = store.New(rdb)
+				slog.Info("Redis connected", "url", cfg.RedisURL)
+			}
+		}
+	} else {
+		slog.Info("REDIS_URL not set — using in-memory fallback for presence/cooldowns")
+	}
+
+	h := hub.New(redisStore, cfg.DefaultCapacity)
 	hnd := handler.New(h, cfg.TokenKey, cfg.AllowedOrigins)
 
 	mux := http.NewServeMux()
