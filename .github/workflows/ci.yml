@@ -11,9 +11,6 @@ permissions:
 jobs:
   test-and-build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: zyra-ws
 
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +18,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
-          go-version-file: zyra-ws/go.mod
+          go-version-file: go.mod
           cache: true
-          cache-dependency-path: zyra-ws/go.sum
+          cache-dependency-path: go.sum
 
       - name: Run tests
         run: go test ./...
