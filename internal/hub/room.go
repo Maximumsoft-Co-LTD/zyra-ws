@@ -20,6 +20,8 @@ type knockEntry struct {
 	zoneID      string
 }
 
+const moveBroadcastInterval = 50 * time.Millisecond
+
 // Room represents all connected clients within a single workspace.
 type Room struct {
 	workspaceID   string
@@ -27,6 +29,13 @@ type Room struct {
 	hub           *Hub
 	waveCooldowns sync.Map // "senderID:targetID" → time.Time (expiry) — fallback when Redis unavailable
 	knockPending  sync.Map // requestID → knockEntry
+
+	// pendingMoves buffers the latest position per player between 50ms broadcast ticks.
+	// handleMove writes here; flushPendingMoves drains and broadcasts at moveBroadcastInterval.
+	pendingMoves sync.Map // userID → MovedPayload
+
+	tickerOnce   sync.Once
+	tickerCancel context.CancelFunc
 }
 
 // redisStore returns the store from the hub (may be nil).
@@ -60,6 +69,13 @@ func (r *Room) register(c *Client) {
 	}
 
 	slog.Info("ws room join", "workspace_id", r.workspaceID, "user_id", c.UserID, "online", r.count())
+
+	// Start the 50ms move broadcast ticker once — lives for the lifetime of this room.
+	r.tickerOnce.Do(func() {
+		tickCtx, cancel := context.WithCancel(context.Background())
+		r.tickerCancel = cancel
+		go r.runMoveTicker(tickCtx)
+	})
 
 	ctx := context.Background()
 
@@ -119,6 +135,10 @@ func (r *Room) unregister(c *Client) {
 
 	slog.Info("ws room leave", "workspace_id", r.workspaceID, "user_id", c.UserID, "online", r.count())
 
+	// Drop any buffered move for this player before broadcasting "left",
+	// preventing a ghost-position message from arriving after the leave event.
+	r.pendingMoves.Delete(c.UserID)
+
 	// Remove Redis presence + save last tile position (LP-3).
 	if s := r.redisStore(); s != nil {
 		ctx := context.Background()
@@ -134,8 +154,11 @@ func (r *Room) unregister(c *Client) {
 		r.broadcastExcept(msg, c.UserID)
 	}
 
-	// Remove empty rooms from the hub.
+	// Remove empty rooms from the hub and stop the ticker.
 	if r.count() == 0 {
+		if r.tickerCancel != nil {
+			r.tickerCancel()
+		}
 		r.hub.removeRoom(r.workspaceID)
 	}
 }
@@ -229,8 +252,10 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 		_ = s.SetPresence(ctx, r.workspaceID, c.UserID, c.DisplayName, c.AvatarURL, c.Status, c.TileX, c.TileY)
 	}
 
-	// Broadcast movement to everyone else in the room.
-	if msg, err := encode(MsgMoved, MovedPayload{
+	// Buffer the latest position; the 50ms ticker will broadcast it to all peers.
+	// Only the newest snapshot per player is kept — intermediate positions are dropped,
+	// which is fine because the canvas engine interpolates between snapshots anyway.
+	r.pendingMoves.Store(c.UserID, MovedPayload{
 		UserID:    c.UserID,
 		TileX:     c.TileX,
 		TileY:     c.TileY,
@@ -239,9 +264,7 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 		AvatarURL: c.AvatarURL,
 		Direction: c.Direction,
 		Sitting:   c.Sitting,
-	}); err == nil {
-		r.broadcastExcept(msg, c.UserID)
-	}
+	})
 }
 
 func (r *Room) handleChat(c *Client, payload json.RawMessage) {
@@ -384,8 +407,10 @@ func (r *Room) handleWave(c *Client, payload json.RawMessage) {
 		r.broadcast(animMsg)
 	}
 
-	// Deliver wave notification only if the target is not in Do-Not-Disturb mode.
-	if target.Status == "dnd" {
+	// Deliver wave notification only if the target has not opted out of interruptions.
+	// Both "dnd" (do not disturb) and "busy" suppress the popup — the animation
+	// still broadcasts to everyone so the sender's gesture remains visible.
+	if target.Status == "dnd" || target.Status == "busy" {
 		return
 	}
 
@@ -435,6 +460,12 @@ func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 	target, ok := r.getClient(p.TargetUserID)
 	if !ok {
 		r.sendError(c, "target not in office")
+		return
+	}
+
+	// Respect the target's availability — busy and dnd users decline unsolicited follows.
+	if target.Status == "busy" || target.Status == "dnd" {
+		r.sendError(c, "user is not available for following")
 		return
 	}
 
@@ -744,6 +775,42 @@ func (r *Room) getClient(userID string) (*Client, bool) {
 func generateRequestID() string {
 	t := time.Now().UnixNano()
 	return fmt.Sprintf("%x", t)
+}
+
+// runMoveTicker broadcasts pending position updates to peers at moveBroadcastInterval (50ms).
+// Regular, predictable delivery lets the canvas engine interpolate smoothly regardless of
+// how many move messages the server received in that window.
+func (r *Room) runMoveTicker(ctx context.Context) {
+	ticker := time.NewTicker(moveBroadcastInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			r.flushPendingMoves()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// flushPendingMoves drains pendingMoves and broadcasts each player's latest position
+// to every other connected client. Players that disconnected since the move was queued
+// are silently skipped — their "left" event has already been delivered.
+func (r *Room) flushPendingMoves() {
+	r.pendingMoves.Range(func(k, v any) bool {
+		userID := k.(string)
+		// Guard: skip players that disconnected between the move arriving and this tick.
+		if _, ok := r.clients.Load(userID); !ok {
+			r.pendingMoves.Delete(k)
+			return true
+		}
+		payload := v.(MovedPayload)
+		r.pendingMoves.Delete(k)
+		if msg, err := encode(MsgMoved, payload); err == nil {
+			r.broadcastExcept(msg, userID)
+		}
+		return true
+	})
 }
 
 // handleSectionSync relays a section state update to every client in the room.
