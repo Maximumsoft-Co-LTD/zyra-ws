@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -13,9 +14,9 @@ import (
 
 // Handler exposes HTTP endpoints for zyra-ws.
 type Handler struct {
-	hub        *hub.Hub
-	tokenKey   string
-	upgrader   websocket.Upgrader
+	hub      *hub.Hub
+	tokenKey string
+	upgrader websocket.Upgrader
 }
 
 // New creates a Handler.
@@ -36,6 +37,7 @@ func New(h *hub.Hub, tokenKey string, allowedOrigins []string) *Handler {
 					return true
 				}
 			}
+			slog.Warn("ws origin rejected", "origin", origin, "allowed", allowedOrigins)
 			return false
 		},
 	}
@@ -84,6 +86,7 @@ func (h *Handler) Connect(w http.ResponseWriter, r *http.Request) {
 
 	claims, err := auth.ValidateToken(tokenStr, h.tokenKey)
 	if err != nil {
+		slog.Warn("ws auth rejected", "error", err, "workspace_id", workspaceID)
 		http.Error(w, "unauthorized: "+err.Error(), http.StatusUnauthorized)
 		return
 	}
