@@ -443,6 +443,41 @@ func (s *RedisStore) GetPendingKnocks(ctx context.Context, wsID, userID string) 
 	return entries, nil
 }
 
+// ── Position snapshot (pixel-accurate, for new joiners & multi-instance) ─────
+
+func posSnapKey(wsID string) string {
+	return fmt.Sprintf("vo:pos:%s", wsID)
+}
+
+// SavePosSnapshot stores a full position snapshot (JSON-encoded MovedPayload) for a player.
+// Called on every move so new joiners receive pixel-accurate positions via the welcome message.
+func (s *RedisStore) SavePosSnapshot(ctx context.Context, wsID, userID string, data []byte) error {
+	if !s.available() {
+		return nil
+	}
+	pipe := s.rdb.Pipeline()
+	pipe.HSet(ctx, posSnapKey(wsID), userID, data)
+	pipe.Expire(ctx, posSnapKey(wsID), presenceTTL)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetAllPosSnapshots returns all stored position snapshots for a workspace.
+func (s *RedisStore) GetAllPosSnapshots(ctx context.Context, wsID string) (map[string]string, error) {
+	if !s.available() {
+		return nil, nil
+	}
+	return s.rdb.HGetAll(ctx, posSnapKey(wsID)).Result()
+}
+
+// DeletePosSnapshot removes a player's position snapshot on disconnect.
+func (s *RedisStore) DeletePosSnapshot(ctx context.Context, wsID, userID string) error {
+	if !s.available() {
+		return nil
+	}
+	return s.rdb.HDel(ctx, posSnapKey(wsID), userID).Err()
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // ParseInt is a small utility to parse string → int.
