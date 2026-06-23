@@ -23,10 +23,11 @@ const (
 
 // Client represents a single WebSocket connection inside a Room.
 type Client struct {
-	hub  *Hub
-	room *Room
-	conn *websocket.Conn
-	send chan []byte // buffered outbound messages
+	hub     *Hub
+	room    *Room
+	conn    *websocket.Conn
+	send    chan []byte // buffered outbound JSON (TextMessage)
+	sendBin chan []byte // buffered outbound binary frames (BinaryMessage)
 
 	UserID        string
 	DisplayName   string
@@ -45,6 +46,11 @@ type Client struct {
 	// Tracked in-memory so the unfollow handler can notify the previous target
 	// without an extra Redis round-trip.
 	FollowTargetID string
+
+	// lastSnapAt is the wall-clock time of the last SavePosSnapshot Redis write.
+	// Snapshots are throttled to at most 1 per second — new joiners only need
+	// periodic accuracy, not a write on every 20 Hz move.
+	lastSnapAt time.Time
 }
 
 // Player converts the client's current state into a Player DTO.
@@ -66,7 +72,7 @@ func (c *Client) Player() Player {
 	}
 }
 
-// WritePump pumps messages from the send channel to the WebSocket connection.
+// WritePump pumps messages from the send channels to the WebSocket connection.
 // Each client has exactly one WritePump goroutine.
 func (c *Client) WritePump() {
 	ticker := time.NewTicker(pingPeriod)
@@ -85,6 +91,12 @@ func (c *Client) WritePump() {
 				return
 			}
 			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+
+		case msg := <-c.sendBin:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait)) //nolint:errcheck
+			if err := c.conn.WriteMessage(websocket.BinaryMessage, msg); err != nil {
 				return
 			}
 
@@ -133,7 +145,7 @@ func (c *Client) EffectiveName() string {
 	return c.DisplayName
 }
 
-// Send enqueues a message for the client's write pump.
+// Send enqueues a JSON message for the client's write pump.
 // Drops the message and closes the connection if the send buffer is full.
 func (c *Client) Send(msg []byte) {
 	select {
@@ -142,5 +154,17 @@ func (c *Client) Send(msg []byte) {
 		slog.Warn("ws send buffer full — dropping client", "user_id", c.UserID)
 		c.room.unregister(c)
 		close(c.send)
+	}
+}
+
+// SendBin enqueues a binary frame for the client's write pump.
+// Drops the message and closes the connection if the binary send buffer is full.
+func (c *Client) SendBin(msg []byte) {
+	select {
+	case c.sendBin <- msg:
+	default:
+		slog.Warn("ws binary send buffer full — dropping client", "user_id", c.UserID)
+		c.room.unregister(c)
+		close(c.send) // close text channel to signal WritePump to exit
 	}
 }

@@ -63,8 +63,18 @@ func main() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		<-quit
-		slog.Info("shutting down zyra-ws")
+		slog.Info("shutting down zyra-ws — draining clients")
 
+		// 1. Notify all connected clients so they start reconnecting before
+		//    their connection is torn down. nginx will route them to a live instance.
+		h.Drain()
+
+		// 2. Give clients enough time to receive the message and initiate a reconnect.
+		//    Must be shorter than the rolling-deploy replacement window so the old
+		//    instance is gone before the drain window expires.
+		time.Sleep(3 * time.Second)
+
+		// 3. Stop accepting new /ws connections and wait for in-flight handlers.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		srv.Shutdown(ctx) //nolint:errcheck

@@ -1,6 +1,10 @@
 package hub
 
-import "encoding/json"
+import (
+	"encoding/binary"
+	"encoding/json"
+	"math"
+)
 
 // ── Outbound message types (server → client) ──────────────────────────────────
 
@@ -28,6 +32,7 @@ const (
 	MsgCapacityReached = "capacity_reached" // unicast: office is full — connection will be closed
 	MsgSectionSync     = "section_sync"     // broadcast: section state changed (relay from any client)
 	MsgWaveAnimation   = "wave_animation"   // broadcast: show wave animation on sender's avatar
+	MsgServerDrain     = "server_drain"     // broadcast: server is shutting down — client should reconnect
 )
 
 // Envelope is the top-level wrapper for all messages in both directions.
@@ -156,6 +161,13 @@ type CapacityReachedPayload struct {
 	Message string `json:"message"`
 }
 
+// ServerDrainPayload is broadcast to all clients when the server is about to shut down.
+// Clients should begin reconnecting immediately; nginx will route them to a live instance.
+type ServerDrainPayload struct {
+	Reason            string `json:"reason"`             // always "server_shutdown"
+	ReconnectAfterMs  int    `json:"reconnect_after_ms"` // suggested reconnect delay in ms
+}
+
 // KnockDecidedPayload is broadcast to all room occupants so they can dismiss the notification.
 type KnockDecidedPayload struct {
 	RequestID string `json:"request_id"`
@@ -267,4 +279,122 @@ func encode(msgType string, payload any) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(Envelope{Type: msgType, Payload: raw})
+}
+
+// ── Binary moved_bin frame ────────────────────────────────────────────────────
+//
+// Layout (little-endian, WebSocket BinaryMessage):
+//
+//	[0]         : 0x01 (BinTypeMoved)
+//	[1]         : N — user_id length (uint8, max 255)
+//	[2..N+1]    : user_id (UTF-8 bytes)
+//	[N+2..N+3]  : tile_x (int16)
+//	[N+4..N+5]  : tile_y (int16)
+//	[N+6..N+9]  : px (float32) — world pixel X
+//	[N+10..N+13]: py (float32) — world pixel Y
+//	[N+14]      : direction byte (0=none 1=up 2=down 3=left 4=right)
+//	[N+15]      : flags (bit 0 = sitting)
+//
+// avatar_url is intentionally omitted: receivers already hold it from the
+// joined/welcome event and it changes rarely.
+
+const BinTypeMoved = byte(0x01)
+
+const (
+	binDirNone  = uint8(0)
+	binDirUp    = uint8(1)
+	binDirDown  = uint8(2)
+	binDirLeft  = uint8(3)
+	binDirRight = uint8(4)
+)
+
+func encodeDirection(dir string) uint8 {
+	switch dir {
+	case "up":
+		return binDirUp
+	case "down":
+		return binDirDown
+	case "left":
+		return binDirLeft
+	case "right":
+		return binDirRight
+	default:
+		return binDirNone
+	}
+}
+
+// encodeBinMoved serialises a MovedPayload as a compact binary frame.
+// It never fails — callers can use the result directly without error handling.
+func encodeBinMoved(moved MovedPayload) []byte {
+	id := []byte(moved.UserID)
+	if len(id) > 255 {
+		id = id[:255]
+	}
+	buf := make([]byte, 1+1+len(id)+2+2+4+4+1+1)
+	i := 0
+	buf[i] = BinTypeMoved
+	i++
+	buf[i] = uint8(len(id))
+	i++
+	copy(buf[i:], id)
+	i += len(id)
+	binary.LittleEndian.PutUint16(buf[i:], uint16(int16(moved.TileX)))
+	i += 2
+	binary.LittleEndian.PutUint16(buf[i:], uint16(int16(moved.TileY)))
+	i += 2
+	binary.LittleEndian.PutUint32(buf[i:], math.Float32bits(float32(moved.PX)))
+	i += 4
+	binary.LittleEndian.PutUint32(buf[i:], math.Float32bits(float32(moved.PY)))
+	i += 4
+	buf[i] = encodeDirection(moved.Direction)
+	i++
+	if moved.Sitting {
+		buf[i] = 1
+	}
+	return buf
+}
+
+// decodeBinMoved parses a binary moved frame produced by encodeBinMoved.
+// Returns nil if the frame is malformed or has the wrong type byte.
+func decodeBinMoved(b []byte) *MovedPayload {
+	if len(b) < 2 || b[0] != BinTypeMoved {
+		return nil
+	}
+	idLen := int(b[1])
+	if len(b) < 2+idLen+2+2+4+4+1+1 {
+		return nil
+	}
+	i := 2
+	userID := string(b[i : i+idLen])
+	i += idLen
+	tileX := int(int16(binary.LittleEndian.Uint16(b[i:])))
+	i += 2
+	tileY := int(int16(binary.LittleEndian.Uint16(b[i:])))
+	i += 2
+	px := float64(math.Float32frombits(binary.LittleEndian.Uint32(b[i:])))
+	i += 4
+	py := float64(math.Float32frombits(binary.LittleEndian.Uint32(b[i:])))
+	i += 4
+	var direction string
+	switch b[i] {
+	case binDirUp:
+		direction = "up"
+	case binDirDown:
+		direction = "down"
+	case binDirLeft:
+		direction = "left"
+	case binDirRight:
+		direction = "right"
+	}
+	i++
+	sitting := (b[i] & 0x01) != 0
+	return &MovedPayload{
+		UserID:    userID,
+		TileX:     tileX,
+		TileY:     tileY,
+		PX:        px,
+		PY:        py,
+		Direction: direction,
+		Sitting:   sitting,
+	}
 }

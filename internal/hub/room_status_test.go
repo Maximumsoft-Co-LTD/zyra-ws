@@ -12,7 +12,7 @@ import (
 
 func newTestRoom() *Room {
 	h := &Hub{}
-	r := &Room{workspaceID: "ws-test", hub: h}
+	r := &Room{workspaceID: "ws-test", hub: h, aoi: NewAOIGrid(), stopTick: make(chan struct{})}
 	return r
 }
 
@@ -21,15 +21,19 @@ func newTestClient(r *Room, userID, status string) *Client {
 		hub:         r.hub,
 		room:        r,
 		send:        make(chan []byte, 256),
+		sendBin:     make(chan []byte, 256),
 		UserID:      userID,
 		DisplayName: userID,
 		Status:      status,
 	}
 	r.clients.Store(userID, c)
+	r.aoi.Move(c, c.TileX, c.TileY) // seed AOI grid so handleMove AOI broadcast finds this client
 	return c
 }
 
-// drain reads all buffered messages from a client's send channel (non-blocking).
+// drain reads all buffered messages from a client's send channels (non-blocking).
+// Binary moved_bin frames from sendBin are decoded and converted to Envelope so
+// that findMoved() and hasType() work identically for both text and binary paths.
 func drain(c *Client) []Envelope {
 	var out []Envelope
 	for {
@@ -38,6 +42,11 @@ func drain(c *Client) []Envelope {
 			var e Envelope
 			if err := json.Unmarshal(b, &e); err == nil {
 				out = append(out, e)
+			}
+		case b := <-c.sendBin:
+			if p := decodeBinMoved(b); p != nil {
+				raw, _ := json.Marshal(p)
+				out = append(out, Envelope{Type: MsgMoved, Payload: raw})
 			}
 		default:
 			return out

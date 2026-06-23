@@ -46,22 +46,29 @@ func presenceKey(wsID, userID string) string {
 	return fmt.Sprintf("vo:presence:%s:%s", wsID, userID)
 }
 
-// SetPresence writes/refreshes the presence hash for a user.
-func (s *RedisStore) SetPresence(ctx context.Context, wsID, userID, displayName, avatarURL, status string, tileX, tileY int) error {
+// memberSetKey holds the set of userIDs currently online in a workspace.
+// Used for O(1) online-count without KEYS scans.
+func memberSetKey(wsID string) string {
+	return fmt.Sprintf("vo:members:%s", wsID)
+}
+
+// SetPresence writes/refreshes the presence hash for a user (display info only).
+// Tile/pixel position is tracked separately via SavePosSnapshot to avoid writing
+// it on every 20 Hz move — presence is updated only on join, status change, and heartbeat.
+func (s *RedisStore) SetPresence(ctx context.Context, wsID, userID, displayName, avatarURL, status string) error {
 	if !s.available() {
 		return nil
 	}
 	key := presenceKey(wsID, userID)
-	fields := map[string]any{
+	pipe := s.rdb.Pipeline()
+	pipe.HMSet(ctx, key, map[string]any{
 		"display_name": displayName,
 		"avatar_url":   avatarURL,
 		"status":       status,
-		"tile_x":       tileX,
-		"tile_y":       tileY,
-	}
-	pipe := s.rdb.Pipeline()
-	pipe.HMSet(ctx, key, fields)
+	})
 	pipe.Expire(ctx, key, presenceTTL)
+	// Maintain member set for O(1) online count — replaces the KEYS scan.
+	pipe.SAdd(ctx, memberSetKey(wsID), userID)
 	_, err := pipe.Exec(ctx)
 	return err
 }
@@ -74,25 +81,26 @@ func (s *RedisStore) RefreshPresence(ctx context.Context, wsID, userID string) e
 	return s.rdb.Expire(ctx, presenceKey(wsID, userID), presenceTTL).Err()
 }
 
-// DeletePresence removes the presence key when a user leaves.
+// DeletePresence removes the presence key and member-set entry when a user leaves.
 func (s *RedisStore) DeletePresence(ctx context.Context, wsID, userID string) error {
 	if !s.available() {
 		return nil
 	}
-	return s.rdb.Del(ctx, presenceKey(wsID, userID)).Err()
+	pipe := s.rdb.Pipeline()
+	pipe.Del(ctx, presenceKey(wsID, userID))
+	pipe.SRem(ctx, memberSetKey(wsID), userID)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
-// OnlineCount returns the number of active presence keys for a workspace.
+// OnlineCount returns the number of active members for a workspace via O(1) SCARD.
+// Replaces the previous O(N) KEYS scan.
 func (s *RedisStore) OnlineCount(ctx context.Context, wsID string) (int, error) {
 	if !s.available() {
 		return 0, nil
 	}
-	pattern := fmt.Sprintf("vo:presence:%s:*", wsID)
-	keys, err := s.rdb.Keys(ctx, pattern).Result()
-	if err != nil {
-		return 0, err
-	}
-	return len(keys), nil
+	n, err := s.rdb.SCard(ctx, memberSetKey(wsID)).Result()
+	return int(n), err
 }
 
 // ── Room tracking ─────────────────────────────────────────────────────────────

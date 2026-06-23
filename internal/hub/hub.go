@@ -65,7 +65,8 @@ func (h *Hub) Join(
 		hub:           h,
 		room:          room,
 		conn:          conn,
-		send:          make(chan []byte, 64),
+		send:          make(chan []byte, 256),
+		sendBin:       make(chan []byte, 256),
 		UserID:        userID,
 		DisplayName:   displayName,
 		CharacterName: characterName,
@@ -89,10 +90,10 @@ func (h *Hub) Join(
 
 	room.register(c)
 
-	// Persist presence to Redis with the effective spawn tile (last-position or client-provided).
+	// Persist presence to Redis (display info only — position is in the pos snapshot).
 	if h.store != nil {
 		ctx := context.Background()
-		_ = h.store.SetPresence(ctx, workspaceID, userID, displayName, avatarURL, "available", c.TileX, c.TileY)
+		_ = h.store.SetPresence(ctx, workspaceID, userID, displayName, avatarURL, "available")
 	}
 
 	go c.WritePump()
@@ -113,12 +114,39 @@ func (h *Hub) getOrCreateRoom(workspaceID string) *Room {
 	if v, ok := h.rooms.Load(workspaceID); ok {
 		return v.(*Room)
 	}
-	room := &Room{workspaceID: workspaceID, hub: h}
-	actual, _ := h.rooms.LoadOrStore(workspaceID, room)
+	room := &Room{
+		workspaceID: workspaceID,
+		hub:         h,
+		aoi:         NewAOIGrid(),
+		stopTick:    make(chan struct{}),
+	}
+	actual, loaded := h.rooms.LoadOrStore(workspaceID, room)
+	if !loaded {
+		go room.runMoveTicker()
+	}
 	return actual.(*Room)
 }
 
 func (h *Hub) removeRoom(workspaceID string) {
 	h.rooms.Delete(workspaceID)
 	slog.Info("ws room removed (empty)", "workspace_id", workspaceID)
+}
+
+// Drain broadcasts server_drain to every connected client across all rooms.
+// Call this before srv.Shutdown so clients have a chance to reconnect to a
+// healthy instance before their connection is torn down.
+func (h *Hub) Drain() {
+	msg, err := encode(MsgServerDrain, ServerDrainPayload{
+		Reason:           "server_shutdown",
+		ReconnectAfterMs: 1000,
+	})
+	if err != nil {
+		slog.Error("drain: failed to encode server_drain", "error", err)
+		return
+	}
+	h.rooms.Range(func(_, v any) bool {
+		v.(*Room).broadcast(msg)
+		return true
+	})
+	slog.Info("drain: server_drain broadcast sent to all clients")
 }

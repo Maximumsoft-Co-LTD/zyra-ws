@@ -20,6 +20,13 @@ type knockEntry struct {
 	zoneID      string
 }
 
+// pendingMoveEntry holds the latest buffered move for one player between tick flushes.
+// roomID is captured at buffer time so flushMoves can route without touching the Client.
+type pendingMoveEntry struct {
+	moved  MovedPayload
+	roomID string
+}
+
 // Room represents all connected clients within a single workspace.
 type Room struct {
 	workspaceID   string
@@ -27,6 +34,10 @@ type Room struct {
 	hub           *Hub
 	waveCooldowns sync.Map // "senderID:targetID" → time.Time (expiry) — fallback when Redis unavailable
 	knockPending  sync.Map // requestID → knockEntry
+	aoi           *AOIGrid // open-floor spatial index for move broadcast filtering
+	pendingMoves  sync.Map // userID → pendingMoveEntry — latest position per player, flushed every 50ms
+	stopTick      chan struct{}
+	stopTickOnce  sync.Once
 }
 
 // redisStore returns the store from the hub (may be nil).
@@ -51,6 +62,9 @@ func (r *Room) register(c *Client) {
 
 	// Store the new client first, then evict the old one.
 	r.clients.Store(c.UserID, c)
+	// Seed initial position into the AOI grid so the client is visible to
+	// nearby peers immediately — even before they send their first move.
+	r.aoi.Move(c, c.TileX, c.TileY)
 
 	if oldClient != nil {
 		// Force-close the old connection so its goroutines exit without holding resources.
@@ -119,6 +133,9 @@ func (r *Room) unregister(c *Client) {
 
 	slog.Info("ws room leave", "workspace_id", r.workspaceID, "user_id", c.UserID, "online", r.count())
 
+	// Remove from AOI grid so departing player stops receiving broadcasts.
+	r.aoi.Remove(c.UserID)
+
 	// Remove Redis presence, position snapshot, and save last tile (LP-3).
 	if s := r.redisStore(); s != nil {
 		ctx := context.Background()
@@ -137,6 +154,7 @@ func (r *Room) unregister(c *Client) {
 
 	if r.count() == 0 {
 		r.hub.removeRoom(r.workspaceID)
+		r.shutdown()
 	}
 }
 
@@ -215,6 +233,7 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 		c.PX = p.PX
 		c.PY = p.PY
 	}
+	prevAvatarURL := c.AvatarURL
 	if p.AvatarURL != "" {
 		c.AvatarURL = p.AvatarURL
 	}
@@ -233,19 +252,75 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 		Direction: c.Direction,
 		Sitting:   c.Sitting,
 	}
-	if s := r.redisStore(); s != nil {
-		ctx := context.Background()
-		_ = s.SetPresence(ctx, r.workspaceID, c.UserID, c.DisplayName, c.AvatarURL, c.Status, c.TileX, c.TileY)
-		// Cache pixel-accurate snapshot so new joiners receive correct positions.
-		if raw, err := json.Marshal(moved); err == nil {
-			_ = s.SavePosSnapshot(ctx, r.workspaceID, c.UserID, raw)
+
+	// When AvatarURL changes (e.g. player transitions between sitting and standing
+	// spritesheets), immediately broadcast a full JSON moved event so peers can
+	// update their texture cache.  Regular binary tick frames omit avatar_url for
+	// bandwidth efficiency, so peers would otherwise never learn the new URL.
+	if prevAvatarURL != c.AvatarURL {
+		if msg, err := encode(MsgMoved, moved); err == nil {
+			r.broadcastExcept(msg, c.UserID)
 		}
 	}
-	// Broadcast immediately to all peers — no batching.
-	// Client-side interpolation buffer absorbs remaining network jitter.
-	if msg, err := encode(MsgMoved, moved); err == nil {
-		r.broadcastExcept(msg, c.UserID)
+	if s := r.redisStore(); s != nil {
+		// Throttle snapshot writes to 1/s — new joiners only need periodic accuracy,
+		// not a Redis write on every 20 Hz move (was 4 cmds/move = 80k cmds/s at 1k CCU).
+		if time.Since(c.lastSnapAt) >= time.Second {
+			c.lastSnapAt = time.Now()
+			ctx := context.Background()
+			if raw, err := json.Marshal(moved); err == nil {
+				_ = s.SavePosSnapshot(ctx, r.workspaceID, c.UserID, raw)
+			}
+		}
 	}
+
+	// Update the spatial grid and buffer this move for the next tick flush.
+	// Encoding and fan-out happen in flushMoves every 50ms — this keeps the
+	// hot path (ReadPump goroutine) free of encode + per-peer Send overhead.
+	r.aoi.Move(c, c.TileX, c.TileY)
+	r.pendingMoves.Store(c.UserID, pendingMoveEntry{moved: moved, roomID: c.RoomID})
+}
+
+// runMoveTicker flushes buffered moves to peers every 50ms.
+// It runs as a dedicated goroutine per Room and stops when stopTick is closed.
+func (r *Room) runMoveTicker() {
+	t := time.NewTicker(50 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			r.flushMoves()
+		case <-r.stopTick:
+			return
+		}
+	}
+}
+
+// flushMoves drains pendingMoves and broadcasts each player's latest position
+// as a compact binary moved_bin frame (WebSocket BinaryMessage).
+// Latest-wins coalescing: if a player sent N moves since the last tick, only
+// the most recent position is sent — intermediate steps are intentionally dropped.
+func (r *Room) flushMoves() {
+	r.pendingMoves.Range(func(k, v any) bool {
+		r.pendingMoves.Delete(k)
+		entry := v.(pendingMoveEntry)
+		msg := encodeBinMoved(entry.moved) // never fails — use directly
+		if entry.roomID != "" {
+			r.broadcastToRoomBin(msg, entry.moved.UserID, entry.roomID)
+		} else {
+			for _, peer := range r.aoi.Subscribers(entry.moved.TileX, entry.moved.TileY, entry.moved.UserID) {
+				peer.SendBin(msg)
+			}
+		}
+		return true
+	})
+}
+
+// shutdown stops the tick goroutine. Safe to call multiple times.
+func (r *Room) shutdown() {
+	r.stopTickOnce.Do(func() {
+		close(r.stopTick)
+	})
 }
 
 func (r *Room) handleChat(c *Client, payload json.RawMessage) {
@@ -294,7 +369,7 @@ func (r *Room) handleStatus(c *Client, payload json.RawMessage) {
 	// Update Redis presence with new status.
 	if s := r.redisStore(); s != nil {
 		ctx := context.Background()
-		_ = s.SetPresence(ctx, r.workspaceID, c.UserID, c.DisplayName, c.AvatarURL, c.Status, c.TileX, c.TileY)
+		_ = s.SetPresence(ctx, r.workspaceID, c.UserID, c.DisplayName, c.AvatarURL, c.Status)
 	}
 
 	if msg, err := encode(MsgStatusChanged, StatusChangedPayload{
@@ -697,6 +772,31 @@ func (r *Room) handleHeartbeat(c *Client) {
 		ctx := context.Background()
 		_ = s.RefreshPresence(ctx, r.workspaceID, c.UserID)
 	}
+}
+
+// broadcastToRoom sends msg to all clients currently inside roomID, except excludeUserID.
+// Used by handleMove tier-1 AOI: only roommates receive movement updates.
+func (r *Room) broadcastToRoom(msg []byte, excludeUserID, roomID string) {
+	r.clients.Range(func(k, v any) bool {
+		if k.(string) != excludeUserID {
+			if c := v.(*Client); c.RoomID == roomID {
+				c.Send(msg)
+			}
+		}
+		return true
+	})
+}
+
+// broadcastToRoomBin sends a binary frame to all clients in a named room except excludeUserID.
+func (r *Room) broadcastToRoomBin(msg []byte, excludeUserID, roomID string) {
+	r.clients.Range(func(k, v any) bool {
+		if k.(string) != excludeUserID {
+			if c := v.(*Client); c.RoomID == roomID {
+				c.SendBin(msg)
+			}
+		}
+		return true
+	})
 }
 
 // broadcast sends a message to every client in the room.
