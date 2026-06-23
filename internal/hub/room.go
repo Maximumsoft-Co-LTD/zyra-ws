@@ -275,16 +275,22 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 	}
 
 	// Update the spatial grid and buffer this move for the next tick flush.
-	// Encoding and fan-out happen in flushMoves every 50ms — this keeps the
+	// Encoding and fan-out happen in flushMoves every 20ms — this keeps the
 	// hot path (ReadPump goroutine) free of encode + per-peer Send overhead.
 	r.aoi.Move(c, c.TileX, c.TileY)
 	r.pendingMoves.Store(c.UserID, pendingMoveEntry{moved: moved, roomID: c.RoomID})
 }
 
-// runMoveTicker flushes buffered moves to peers every 50ms.
+// runMoveTicker flushes buffered moves to peers every 20ms (was 50ms).
+// Reducing the tick from 50→20ms cuts the server-side pipeline latency from
+// up to 50ms to up to 20ms, giving clients fresher position data and making
+// the 100ms interpolation buffer much less likely to run dry.
+// Bandwidth is unchanged because pendingMoves uses latest-wins coalescing:
+// each player contributes at most one binary frame per flush regardless of
+// how many moves they sent since the last tick.
 // It runs as a dedicated goroutine per Room and stops when stopTick is closed.
 func (r *Room) runMoveTicker() {
-	t := time.NewTicker(50 * time.Millisecond)
+	t := time.NewTicker(20 * time.Millisecond)
 	defer t.Stop()
 	for {
 		select {
@@ -296,7 +302,7 @@ func (r *Room) runMoveTicker() {
 	}
 }
 
-// flushMoves drains pendingMoves and broadcasts each player's latest position
+	// flushMoves drains pendingMoves and broadcasts each player's latest position
 // as a compact binary moved_bin frame (WebSocket BinaryMessage).
 // Latest-wins coalescing: if a player sent N moves since the last tick, only
 // the most recent position is sent — intermediate steps are intentionally dropped.
