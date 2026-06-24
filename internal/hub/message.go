@@ -17,6 +17,9 @@ const (
 	MsgPong    = "pong"    // response to client ping
 	MsgError   = "error"   // server-side error feedback
 
+	MsgMoving  = "moving"  // broadcast: a player started path-based movement (A→B)
+	MsgStopped = "stopped" // broadcast: a player stopped mid-path
+
 	MsgStatusChanged = "status_changed" // broadcast: a player changed their status
 	MsgRoomEntered   = "room_entered"   // broadcast: a player entered a private room
 	MsgRoomExited    = "room_exited"    // broadcast: a player exited a private room
@@ -56,6 +59,13 @@ type Player struct {
 	RoomID        string  `json:"room_id,omitempty"`
 	Direction     string  `json:"direction,omitempty"`
 	Sitting       bool    `json:"sitting,omitempty"`
+
+	// Active path movement — populated only when the player is mid-walk so
+	// newly joined clients can start interpolating from the correct point.
+	ActivePath       []TilePoint `json:"active_path,omitempty"`
+	ActiveDurationMs int         `json:"active_duration_ms,omitempty"`
+	ActiveSpeed      float64     `json:"active_speed,omitempty"`
+	ActiveElapsedMs  int         `json:"active_elapsed_ms,omitempty"`
 }
 
 // ── Outbound payloads ─────────────────────────────────────────────────────────
@@ -199,6 +209,8 @@ const (
 	ClientMsgKnock        = "knock"
 	ClientMsgKnockDecide = "knock_decision"
 	ClientMsgKnockCancel = "knock_cancel"
+	ClientMsgMoveTo      = "move_to"  // path-based movement: client sends waypoints, server calculates duration
+	ClientMsgStop        = "stop"     // interrupt current path movement
 	ClientMsgHeartbeat   = "heartbeat"
 	ClientMsgSectionSync = "section_sync" // client→server→broadcast: notify peers of section state change
 )
@@ -260,6 +272,52 @@ type KnockCancelledPayload struct {
 	ZoneID    string `json:"zone_id"`
 }
 
+// ── Path-based movement payloads ──────────────────────────────────────────────
+
+// TilePoint represents a single tile coordinate in a movement path.
+type TilePoint struct {
+	TileX int `json:"tile_x"`
+	TileY int `json:"tile_y"`
+}
+
+// ClientMoveToPayload is sent by the client to start a path-based movement.
+// The path includes the starting tile and all waypoints to the destination.
+type ClientMoveToPayload struct {
+	Path      []TilePoint `json:"path"`
+	AvatarURL string      `json:"avatar_url"`
+}
+
+// ClientStopPayload is sent by the client to interrupt a path-based movement.
+type ClientStopPayload struct {
+	TileX int     `json:"tile_x"`
+	TileY int     `json:"tile_y"`
+	PX    float64 `json:"px"`
+	PY    float64 `json:"py"`
+}
+
+// MovingPayload is broadcast to peers when a player starts path-based movement.
+// Receiving clients interpolate position along the path over DurationMs.
+type MovingPayload struct {
+	UserID     string      `json:"user_id"`
+	Path       []TilePoint `json:"path"`
+	DurationMs int         `json:"duration_ms"`
+	Speed      float64     `json:"speed"`
+	AvatarURL  string      `json:"avatar_url"`
+}
+
+// StoppedPayload is broadcast to peers when a player stops mid-path.
+type StoppedPayload struct {
+	UserID    string  `json:"user_id"`
+	TileX     int     `json:"tile_x"`
+	TileY     int     `json:"tile_y"`
+	PX        float64 `json:"px"`
+	PY        float64 `json:"py"`
+	Direction string  `json:"direction,omitempty"`
+	Sitting   bool    `json:"sitting"`
+}
+
+// ── Section sync ──────────────────────────────────────────────────────────────
+
 // SectionSyncPayload is relayed verbatim to all clients when any player enters/leaves/grants a zone section.
 type SectionSyncPayload struct {
 	ZoneID      string   `json:"zone_id"`
@@ -279,6 +337,46 @@ func encode(msgType string, payload any) ([]byte, error) {
 		return nil, err
 	}
 	return json.Marshal(Envelope{Type: msgType, Payload: raw})
+}
+
+// ── Movement physics constants ────────────────────────────────────────────────
+// Must stay in sync with zyra-app/zyra-engine/constants.ts.
+
+const (
+	tileSize    = 32    // px per tile — matches TILE_SIZE in constants.ts
+	playerSpeed = 120.0 // px per second — matches PLAYER_SPEED in constants.ts
+	maxPathLen  = 200   // max waypoints per move_to (anti-abuse)
+)
+
+// pathDistancePx calculates the total Euclidean distance (in px) along a path of tiles.
+// Each tile is tileSize px wide, so the pixel distance between adjacent tiles depends
+// on whether the step is cardinal (32 px) or diagonal (≈45.25 px).
+func pathDistancePx(path []TilePoint) float64 {
+	if len(path) < 2 {
+		return 0
+	}
+	total := 0.0
+	for i := 1; i < len(path); i++ {
+		dx := float64(path[i].TileX-path[i-1].TileX) * tileSize
+		dy := float64(path[i].TileY-path[i-1].TileY) * tileSize
+		total += math.Sqrt(dx*dx + dy*dy)
+	}
+	return total
+}
+
+// pathDurationMs returns how long (ms) a player at the given speed would take
+// to walk the path.  speed is px/s, distance is px.
+func pathDurationMs(path []TilePoint, speed float64) int {
+	dist := pathDistancePx(path)
+	if dist == 0 || speed <= 0 {
+		return 0
+	}
+	return int(dist / speed * 1000)
+}
+
+// tileCenterPx returns the world-pixel center of a tile.
+func tileCenterPx(tx, ty int) (float64, float64) {
+	return float64(tx)*tileSize + tileSize/2, float64(ty)*tileSize + tileSize/2
 }
 
 // ── Binary moved_bin frame ────────────────────────────────────────────────────

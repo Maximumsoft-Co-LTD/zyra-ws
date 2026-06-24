@@ -137,10 +137,16 @@ func (r *Room) unregister(c *Client) {
 	r.aoi.Remove(c.UserID)
 
 	// Remove Redis presence, position snapshot, and save last tile (LP-3).
+	// If the player was mid-walk (IsMoving), save the pre-move start tile
+	// instead of the destination tile — the player never actually reached it.
 	if s := r.redisStore(); s != nil {
 		ctx := context.Background()
-		if c.TileX != 0 || c.TileY != 0 {
-			_ = s.SetLastPosition(ctx, r.workspaceID, c.UserID, c.TileX, c.TileY)
+		saveTX, saveTY := c.TileX, c.TileY
+		if c.IsMoving {
+			saveTX, saveTY = c.MoveStartTX, c.MoveStartTY
+		}
+		if saveTX != 0 || saveTY != 0 {
+			_ = s.SetLastPosition(ctx, r.workspaceID, c.UserID, saveTX, saveTY)
 		}
 		_ = s.DeletePresence(ctx, r.workspaceID, c.UserID)
 		_ = s.ClearRoom(ctx, r.workspaceID, c.UserID)
@@ -193,6 +199,10 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 		r.handleKnockDecide(c, env.Payload)
 	case ClientMsgKnockCancel:
 		r.handleKnockCancel(c, env.Payload)
+	case ClientMsgMoveTo:
+		r.handleMoveTo(c, env.Payload)
+	case ClientMsgStop:
+		r.handleStop(c, env.Payload)
 	case ClientMsgHeartbeat:
 		r.handleHeartbeat(c)
 	case ClientMsgSectionSync:
@@ -279,6 +289,145 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 	// hot path (ReadPump goroutine) free of encode + per-peer Send overhead.
 	r.aoi.Move(c, c.TileX, c.TileY)
 	r.pendingMoves.Store(c.UserID, pendingMoveEntry{moved: moved, roomID: c.RoomID})
+}
+
+// handleMoveTo processes a path-based movement request.
+// The client sends a path of tile waypoints; the server calculates the travel
+// duration from the path distance and player speed, then broadcasts a "moving"
+// event to all peers so they can interpolate the position locally.
+func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
+	var p ClientMoveToPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid move_to payload")
+		return
+	}
+	if len(p.Path) < 2 {
+		r.sendError(c, "move_to path must have at least 2 points")
+		return
+	}
+	if len(p.Path) > maxPathLen {
+		r.sendError(c, fmt.Sprintf("move_to path too long (max %d)", maxPathLen))
+		return
+	}
+
+	// Validate that consecutive tiles are adjacent (Manhattan distance ≤ 1 per step).
+	for i := 1; i < len(p.Path); i++ {
+		dx := absInt(p.Path[i].TileX - p.Path[i-1].TileX)
+		dy := absInt(p.Path[i].TileY - p.Path[i-1].TileY)
+		if dx > 1 || dy > 1 || (dx == 0 && dy == 0) {
+			r.sendError(c, "move_to path contains non-adjacent tiles")
+			return
+		}
+	}
+
+	// Validate start position is close to the player's current position.
+	start := p.Path[0]
+	if (c.TileX != 0 || c.TileY != 0) &&
+		(absInt(start.TileX-c.TileX) > 3 || absInt(start.TileY-c.TileY) > 3) {
+		r.sendError(c, "move_to start too far from current position")
+		return
+	}
+
+	if p.AvatarURL != "" {
+		c.AvatarURL = p.AvatarURL
+	}
+
+	// Capture pre-move position once (first unconfirmed walk). On disconnect
+	// before stop arrives, unregister saves this tile instead of the unreached
+	// destination, preventing players from teleporting forward after reconnect.
+	if !c.IsMoving {
+		c.MoveStartTX = c.TileX
+		c.MoveStartTY = c.TileY
+	}
+	c.IsMoving = true
+
+	// Update client state to the destination tile for AOI and snapshot.
+	dest := p.Path[len(p.Path)-1]
+	c.TileX = dest.TileX
+	c.TileY = dest.TileY
+	c.PX, c.PY = tileCenterPx(dest.TileX, dest.TileY)
+
+	durationMs := pathDurationMs(p.Path, playerSpeed)
+
+	// Store active path so newly joined clients can resume interpolation.
+	c.MovePath = p.Path
+	c.MoveDurationMs = durationMs
+	c.MoveSpeed = playerSpeed
+	c.MoveStartedAt = time.Now()
+	if durationMs == 0 {
+		return
+	}
+
+	moving := MovingPayload{
+		UserID:     c.UserID,
+		Path:       p.Path,
+		DurationMs: durationMs,
+		Speed:      playerSpeed,
+		AvatarURL:  c.AvatarURL,
+	}
+
+	if msg, err := encode(MsgMoving, moving); err == nil {
+		if c.RoomID != "" {
+			r.broadcastToRoom(msg, c.UserID, c.RoomID)
+		} else {
+			r.broadcastExcept(msg, c.UserID)
+		}
+	}
+
+	r.aoi.Move(c, c.TileX, c.TileY)
+
+	// Throttled Redis snapshot for reconnect/new-joiner state.
+	if s := r.redisStore(); s != nil && time.Since(c.lastSnapAt) >= time.Second {
+		c.lastSnapAt = time.Now()
+		ctx := context.Background()
+		moved := MovedPayload{
+			UserID: c.UserID, TileX: c.TileX, TileY: c.TileY,
+			PX: c.PX, PY: c.PY, AvatarURL: c.AvatarURL,
+		}
+		if raw, err := json.Marshal(moved); err == nil {
+			_ = s.SavePosSnapshot(ctx, r.workspaceID, c.UserID, raw)
+		}
+	}
+}
+
+// handleStop processes a movement interruption.
+// The client sends their current position; the server broadcasts a "stopped"
+// event so peers can halt the ongoing path interpolation at the correct spot.
+func (r *Room) handleStop(c *Client, payload json.RawMessage) {
+	var p ClientStopPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid stop payload")
+		return
+	}
+
+	c.IsMoving = false
+	c.MovePath = nil
+	c.TileX = p.TileX
+	c.TileY = p.TileY
+	if p.PX != 0 || p.PY != 0 {
+		c.PX = p.PX
+		c.PY = p.PY
+	}
+
+	stopped := StoppedPayload{
+		UserID:    c.UserID,
+		TileX:     c.TileX,
+		TileY:     c.TileY,
+		PX:        c.PX,
+		PY:        c.PY,
+		Direction: c.Direction,
+		Sitting:   c.Sitting,
+	}
+
+	if msg, err := encode(MsgStopped, stopped); err == nil {
+		if c.RoomID != "" {
+			r.broadcastToRoom(msg, c.UserID, c.RoomID)
+		} else {
+			r.broadcastExcept(msg, c.UserID)
+		}
+	}
+
+	r.aoi.Move(c, c.TileX, c.TileY)
 }
 
 // runMoveTicker flushes buffered moves to peers every 20ms (was 50ms).

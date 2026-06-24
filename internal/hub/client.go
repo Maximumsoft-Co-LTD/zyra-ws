@@ -47,6 +47,21 @@ type Client struct {
 	// without an extra Redis round-trip.
 	FollowTargetID string
 
+	// IsMoving is true while the player is walking a path (between move_to and stop).
+	// MoveStartTX/TY stores the tile when the walk began so that unregister
+	// can persist the pre-move position on abrupt disconnect instead of the
+	// unreached destination tile.
+	IsMoving     bool
+	MoveStartTX  int
+	MoveStartTY  int
+
+	// Active path movement state — retained so newly joined clients can pick up
+	// the in-progress walk and start interpolating from the correct point.
+	MovePath       []TilePoint
+	MoveDurationMs int
+	MoveSpeed      float64
+	MoveStartedAt  time.Time
+
 	// lastSnapAt is the wall-clock time of the last SavePosSnapshot Redis write.
 	// Snapshots are throttled to at most 1 per second — new joiners only need
 	// periodic accuracy, not a write on every 20 Hz move.
@@ -55,7 +70,7 @@ type Client struct {
 
 // Player converts the client's current state into a Player DTO.
 func (c *Client) Player() Player {
-	return Player{
+	p := Player{
 		UserID:        c.UserID,
 		DisplayName:   c.DisplayName,
 		CharacterName: c.CharacterName,
@@ -70,6 +85,16 @@ func (c *Client) Player() Player {
 		Direction:     c.Direction,
 		Sitting:       c.Sitting,
 	}
+	if c.IsMoving && len(c.MovePath) >= 2 {
+		elapsed := int(time.Since(c.MoveStartedAt).Milliseconds())
+		if elapsed < c.MoveDurationMs {
+			p.ActivePath = c.MovePath
+			p.ActiveDurationMs = c.MoveDurationMs
+			p.ActiveSpeed = c.MoveSpeed
+			p.ActiveElapsedMs = elapsed
+		}
+	}
+	return p
 }
 
 // WritePump pumps messages from the send channels to the WebSocket connection.
