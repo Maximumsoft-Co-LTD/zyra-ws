@@ -307,6 +307,37 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 	r.pendingMoves.Store(c.UserID, pendingMoveEntry{moved: moved, roomID: c.RoomID})
 }
 
+// currentPathTile returns the tile a player is at right now along an active path,
+// based on how long ago the walk started. Steps are one tile each (equidistant),
+// so elapsed time maps linearly to the waypoint index. Used to reconcile the
+// server's authoritative position when a player re-paths before finishing the
+// previous path (see handleMoveTo).
+func currentPathTile(path []TilePoint, durationMs int, startedAt time.Time) TilePoint {
+	n := len(path)
+	if n == 0 {
+		return TilePoint{}
+	}
+	if durationMs <= 0 || n == 1 {
+		return path[n-1]
+	}
+	elapsed := int(time.Since(startedAt).Milliseconds())
+	if elapsed <= 0 {
+		return path[0]
+	}
+	if elapsed >= durationMs {
+		return path[n-1]
+	}
+	// idx = round(progress * (n-1)) using integer math (no math.Round import).
+	idx := (elapsed*(n-1) + durationMs/2) / durationMs
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= n {
+		idx = n - 1
+	}
+	return path[idx]
+}
+
 // handleMoveTo processes a path-based movement request.
 // The client sends a path of tile waypoints; the server calculates the travel
 // duration from the path distance and player speed, then broadcasts a "moving"
@@ -335,6 +366,21 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 			r.forceSync(c, "invalid_path")
 			return
 		}
+	}
+
+	// If the player is still mid-path from a previous move_to, advance the server's
+	// authoritative position to where they actually are NOW before validating the
+	// new path's start. On receipt the server snaps TileX/TileY to a move_to's
+	// DESTINATION (below), assuming the whole path is walked. A follower re-paths
+	// continuously as its target moves, so its next move_to starts from its real
+	// mid-path tile — not that destination. Checking that against the stale
+	// destination wrongly trips desync_start → force_sync, snapping the follower's
+	// own avatar (the "walk down then warp back" the moving player sees). Reconcile.
+	if c.IsMoving && len(c.MovePath) >= 2 {
+		cur := currentPathTile(c.MovePath, c.MoveDurationMs, c.MoveStartedAt)
+		c.TileX = cur.TileX
+		c.TileY = cur.TileY
+		c.PX, c.PY = tileCenterPx(cur.TileX, cur.TileY)
 	}
 
 	// Validate start position is close to the player's current position.
