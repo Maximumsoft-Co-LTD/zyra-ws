@@ -38,7 +38,17 @@ type Room struct {
 	pendingMoves  sync.Map // userID → pendingMoveEntry — latest position per player, flushed every 50ms
 	stopTick      chan struct{}
 	stopTickOnce  sync.Once
+
+	// Obstacle grid for movement validation (bounds + blocked tiles). Loaded from
+	// Redis and refreshed every obstacleTTL so an owner's mid-session grid upload
+	// propagates without recreating the room. nil = no grid → validation disabled.
+	obstacleMu       sync.Mutex
+	obstacleLoadedAt time.Time
+	obstacleGrid     *store.ObstacleGrid
 }
+
+// obstacleTTL bounds how stale the cached obstacle grid may be.
+const obstacleTTL = 30 * time.Second
 
 // redisStore returns the store from the hub (may be nil).
 func (r *Room) redisStore() *store.RedisStore {
@@ -178,9 +188,7 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 	case ClientMsgChat:
 		r.handleChat(c, env.Payload)
 	case ClientMsgPing:
-		if msg, err := encode(MsgPong, nil); err == nil {
-			c.Send(msg)
-		}
+		r.handlePing(c, env.Payload)
 	case ClientMsgStatus:
 		r.handleStatus(c, env.Payload)
 	case ClientMsgRoomEnter:
@@ -232,7 +240,15 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 	dx := absInt(p.TileX - c.TileX)
 	dy := absInt(p.TileY - c.TileY)
 	if (dx > 3 || dy > 3) && (c.TileX != 0 || c.TileY != 0) {
-		r.sendError(c, "invalid move: teleport detected")
+		// Reject and snap the client back — server position is unchanged here,
+		// so forceSync reflects the last accepted tile.
+		r.forceSync(c, "teleport")
+		return
+	}
+
+	// Out-of-bounds / blocked-tile guard — server position is unchanged on reject.
+	if r.tileBlocked(r.getObstacleGrid(), p.TileX, p.TileY) {
+		r.forceSync(c, "blocked_dest")
 		return
 	}
 
@@ -315,7 +331,8 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 		dx := absInt(p.Path[i].TileX - p.Path[i-1].TileX)
 		dy := absInt(p.Path[i].TileY - p.Path[i-1].TileY)
 		if dx > 1 || dy > 1 || (dx == 0 && dy == 0) {
-			r.sendError(c, "move_to path contains non-adjacent tiles")
+			// Malformed path — snap the client back to the last accepted position.
+			r.forceSync(c, "invalid_path")
 			return
 		}
 	}
@@ -324,13 +341,28 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 	start := p.Path[0]
 	if (c.TileX != 0 || c.TileY != 0) &&
 		(absInt(start.TileX-c.TileX) > 3 || absInt(start.TileY-c.TileY) > 3) {
-		r.sendError(c, "move_to start too far from current position")
+		// Client's path start drifted from the server position — reconcile.
+		r.forceSync(c, "desync_start")
+		return
+	}
+
+	// Lenient wall/bounds validation: only the destination tile is checked.
+	// If it is out of bounds or blocked, reject and snap the client back.
+	dest := p.Path[len(p.Path)-1]
+	if r.tileBlocked(r.getObstacleGrid(), dest.TileX, dest.TileY) {
+		r.forceSync(c, "blocked_dest")
 		return
 	}
 
 	if p.AvatarURL != "" {
 		c.AvatarURL = p.AvatarURL
 	}
+
+	// A moving player is, by definition, standing. Clear the sitting flag so the
+	// welcome/joined snapshot (Player()) never reports a player as sitting while
+	// they walk — otherwise newly joined / resynced peers render the character in
+	// a seated pose floating along the path.
+	c.Sitting = false
 
 	// Capture pre-move position once (first unconfirmed walk). On disconnect
 	// before stop arrives, unregister saves this tile instead of the unreached
@@ -342,7 +374,6 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 	c.IsMoving = true
 
 	// Update client state to the destination tile for AOI and snapshot.
-	dest := p.Path[len(p.Path)-1]
 	c.TileX = dest.TileX
 	c.TileY = dest.TileY
 	c.PX, c.PY = tileCenterPx(dest.TileX, dest.TileY)
@@ -359,11 +390,12 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 	}
 
 	moving := MovingPayload{
-		UserID:     c.UserID,
-		Path:       p.Path,
-		DurationMs: durationMs,
-		Speed:      playerSpeed,
-		AvatarURL:  c.AvatarURL,
+		UserID:       c.UserID,
+		Path:         p.Path,
+		DurationMs:   durationMs,
+		Speed:        playerSpeed,
+		AvatarURL:    c.AvatarURL,
+		ServerTimeMs: c.MoveStartedAt.UnixMilli(),
 	}
 
 	if msg, err := encode(MsgMoving, moving); err == nil {
@@ -408,6 +440,13 @@ func (r *Room) handleStop(c *Client, payload json.RawMessage) {
 		c.PX = p.PX
 		c.PY = p.PY
 	}
+	// Adopt the final facing direction from the stop payload. moveTimer is
+	// suppressed during path walks, so c.Direction would otherwise be stale
+	// and peers would render the wrong facing after the walk ends.
+	if p.Direction != "" {
+		c.Direction = p.Direction
+	}
+	c.Sitting = p.Sitting
 
 	stopped := StoppedPayload{
 		UserID:    c.UserID,
@@ -922,6 +961,21 @@ func (r *Room) handleKnockCancel(c *Client, payload json.RawMessage) {
 	slog.Info("knock cancelled", "workspace", r.workspaceID, "zone", p.ZoneID, "requester", c.UserID)
 }
 
+// handlePing replies with a pong carrying the server's wall-clock time and the
+// echoed client time. The client uses this (with the round-trip time) to compute
+// the server↔client clock offset for server-anchored movement interpolation.
+func (r *Room) handlePing(c *Client, payload json.RawMessage) {
+	var p ClientPingPayload
+	// Tolerate empty/legacy ping payloads ("{}" or absent) — zero value is fine.
+	_ = json.Unmarshal(payload, &p)
+	if msg, err := encode(MsgPong, PongPayload{
+		ServerTimeMs: time.Now().UnixMilli(),
+		ClientTimeMs: p.ClientTimeMs,
+	}); err == nil {
+		c.Send(msg)
+	}
+}
+
 func (r *Room) handleHeartbeat(c *Client) {
 	if s := r.redisStore(); s != nil {
 		ctx := context.Background()
@@ -994,6 +1048,60 @@ func (r *Room) count() int {
 
 func (r *Room) sendError(c *Client, message string) {
 	if msg, err := encode(MsgError, ErrorPayload{Message: message}); err == nil {
+		c.Send(msg)
+	}
+}
+
+// getObstacleGrid lazily loads (and caches for the room's lifetime) the obstacle
+// grid published by zyra-api. Cached once: a re-publish only affects new rooms,
+// which is acceptable since rooms are torn down when empty.
+func (r *Room) getObstacleGrid() *store.ObstacleGrid {
+	r.obstacleMu.Lock()
+	defer r.obstacleMu.Unlock()
+	if !r.obstacleLoadedAt.IsZero() && time.Since(r.obstacleLoadedAt) < obstacleTTL {
+		return r.obstacleGrid
+	}
+	r.obstacleLoadedAt = time.Now()
+	if s := r.redisStore(); s != nil {
+		if g, err := s.GetWorkspaceObstacles(context.Background(), r.workspaceID); err == nil {
+			r.obstacleGrid = g
+		}
+	}
+	return r.obstacleGrid
+}
+
+// tileBlocked reports whether a destination tile is out of bounds or sits on a
+// blocked tile per the published grid. A nil grid never blocks (fail-open).
+func (r *Room) tileBlocked(g *store.ObstacleGrid, tx, ty int) bool {
+	if g == nil {
+		return false
+	}
+	if g.W > 0 && g.H > 0 && (tx < 0 || ty < 0 || tx >= g.W || ty >= g.H) {
+		return true
+	}
+	if len(g.Blocked) > 0 {
+		if _, ok := g.Blocked[fmt.Sprintf("%d,%d", tx, ty)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// forceSync tells the client to snap its local player back to the server's
+// authoritative position. Called after rejecting an invalid move so the client
+// cannot retain a position the server never accepted (reconciliation).
+func (r *Room) forceSync(c *Client, reason string) {
+	px, py := c.PX, c.PY
+	if px == 0 && py == 0 {
+		px, py = tileCenterPx(c.TileX, c.TileY)
+	}
+	if msg, err := encode(MsgForceSync, ForceSyncPayload{
+		TileX:  c.TileX,
+		TileY:  c.TileY,
+		PX:     px,
+		PY:     py,
+		Reason: reason,
+	}); err == nil {
 		c.Send(msg)
 	}
 }

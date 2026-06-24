@@ -486,6 +486,53 @@ func (s *RedisStore) DeletePosSnapshot(ctx context.Context, wsID, userID string)
 	return s.rdb.HDel(ctx, posSnapKey(wsID), userID).Err()
 }
 
+// ── Obstacle grid (movement validation) ───────────────────────────────────────
+
+// obstacleKey mirrors the key written by zyra-api at publish time.
+func obstacleKey(wsID string) string {
+	return fmt.Sprintf("vo:obstacles:%s", wsID)
+}
+
+// ObstacleGrid is the per-workspace movement grid (tile units). Blocked is a set
+// of "x,y" tile keys for O(1) lookup. A nil grid means "no data" → no validation.
+type ObstacleGrid struct {
+	W       int
+	H       int
+	Blocked map[string]struct{}
+}
+
+// obstacleGridJSON matches the JSON shape written by zyra-api's cache.ObstacleGrid.
+type obstacleGridJSON struct {
+	W       int      `json:"w"`
+	H       int      `json:"h"`
+	Blocked []string `json:"blocked"`
+}
+
+// GetWorkspaceObstacles reads and parses the obstacle grid for a workspace.
+// Returns (nil, nil) when Redis is unavailable or no grid has been published —
+// callers treat that as "validation disabled".
+func (s *RedisStore) GetWorkspaceObstacles(ctx context.Context, wsID string) (*ObstacleGrid, error) {
+	if !s.available() {
+		return nil, nil
+	}
+	raw, err := s.rdb.Get(ctx, obstacleKey(wsID)).Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var parsed obstacleGridJSON
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, err
+	}
+	grid := &ObstacleGrid{W: parsed.W, H: parsed.H, Blocked: make(map[string]struct{}, len(parsed.Blocked))}
+	for _, k := range parsed.Blocked {
+		grid.Blocked[k] = struct{}{}
+	}
+	return grid, nil
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 // ParseInt is a small utility to parse string → int.

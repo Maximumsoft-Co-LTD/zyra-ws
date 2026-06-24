@@ -36,6 +36,7 @@ const (
 	MsgSectionSync     = "section_sync"     // broadcast: section state changed (relay from any client)
 	MsgWaveAnimation   = "wave_animation"   // broadcast: show wave animation on sender's avatar
 	MsgServerDrain     = "server_drain"     // broadcast: server is shutting down — client should reconnect
+	MsgForceSync       = "force_sync"       // unicast: server corrects the client's position (reconciliation)
 )
 
 // Envelope is the top-level wrapper for all messages in both directions.
@@ -178,6 +179,18 @@ type ServerDrainPayload struct {
 	ReconnectAfterMs  int    `json:"reconnect_after_ms"` // suggested reconnect delay in ms
 }
 
+// ForceSyncPayload tells a single client to snap its local player back to the
+// server-authoritative position. Sent when the server rejects a move (teleport,
+// malformed path, desynced start) so the client cannot keep a position the
+// server never accepted.
+type ForceSyncPayload struct {
+	TileX  int     `json:"tile_x"`
+	TileY  int     `json:"tile_y"`
+	PX     float64 `json:"px"`
+	PY     float64 `json:"py"`
+	Reason string  `json:"reason,omitempty"`
+}
+
 // KnockDecidedPayload is broadcast to all room occupants so they can dismiss the notification.
 type KnockDecidedPayload struct {
 	RequestID string `json:"request_id"`
@@ -227,6 +240,20 @@ type ClientMovePayload struct {
 
 type ClientChatPayload struct {
 	Content string `json:"content"`
+}
+
+// ClientPingPayload carries the client's local timestamp so the server can echo
+// it back for round-trip clock-offset measurement. Legacy clients send {} — the
+// zero value is tolerated.
+type ClientPingPayload struct {
+	ClientTimeMs int64 `json:"client_time_ms,omitempty"`
+}
+
+// PongPayload echoes the client time and adds the server time so the client can
+// estimate the server↔client clock offset (NTP-style, single round trip).
+type PongPayload struct {
+	ServerTimeMs int64 `json:"server_time_ms"`
+	ClientTimeMs int64 `json:"client_time_ms,omitempty"`
 }
 
 type ClientStatusPayload struct {
@@ -289,10 +316,12 @@ type ClientMoveToPayload struct {
 
 // ClientStopPayload is sent by the client to interrupt a path-based movement.
 type ClientStopPayload struct {
-	TileX int     `json:"tile_x"`
-	TileY int     `json:"tile_y"`
-	PX    float64 `json:"px"`
-	PY    float64 `json:"py"`
+	TileX     int     `json:"tile_x"`
+	TileY     int     `json:"tile_y"`
+	PX        float64 `json:"px"`
+	PY        float64 `json:"py"`
+	Direction string  `json:"direction,omitempty"`
+	Sitting   bool    `json:"sitting,omitempty"`
 }
 
 // MovingPayload is broadcast to peers when a player starts path-based movement.
@@ -303,6 +332,11 @@ type MovingPayload struct {
 	DurationMs int         `json:"duration_ms"`
 	Speed      float64     `json:"speed"`
 	AvatarURL  string      `json:"avatar_url"`
+	// ServerTimeMs is the server wall-clock (UnixMilli) when the movement began.
+	// Combined with the client's measured clock offset, every peer anchors the
+	// animation to the same absolute timeline so positions stay in sync across
+	// clients regardless of when each one received this event (Gather-V2 style).
+	ServerTimeMs int64 `json:"server_time_ms,omitempty"`
 }
 
 // StoppedPayload is broadcast to peers when a player stops mid-path.
