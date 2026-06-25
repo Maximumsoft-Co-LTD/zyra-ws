@@ -20,14 +20,14 @@ const (
 	MsgMoving  = "moving"  // broadcast: a player started path-based movement (A→B)
 	MsgStopped = "stopped" // broadcast: a player stopped mid-path
 
-	MsgStatusChanged = "status_changed" // broadcast: a player changed their status
-	MsgRoomEntered   = "room_entered"   // broadcast: a player entered a private room
-	MsgRoomExited    = "room_exited"    // broadcast: a player exited a private room
-	MsgWaveReceived  = "wave_received"  // unicast: target player received a wave
-	MsgFollowStarted  = "follow_started"  // unicast: target player is being followed
-	MsgFollowEnded    = "follow_ended"    // unicast: follower stopped following (sent to target)
-	MsgFollowRevoked  = "follow_revoked"  // unicast: target stopped the follow (sent to follower)
-	MsgKnockRequest  = "knock_request"  // broadcast: someone knocked on a zone
+	MsgStatusChanged   = "status_changed"   // broadcast: a player changed their status
+	MsgRoomEntered     = "room_entered"     // broadcast: a player entered a private room
+	MsgRoomExited      = "room_exited"      // broadcast: a player exited a private room
+	MsgWaveReceived    = "wave_received"    // unicast: target player received a wave
+	MsgFollowStarted   = "follow_started"   // unicast: target player is being followed
+	MsgFollowEnded     = "follow_ended"     // unicast: follower stopped following (sent to target)
+	MsgFollowRevoked   = "follow_revoked"   // unicast: target stopped the follow (sent to follower)
+	MsgKnockRequest    = "knock_request"    // broadcast: someone knocked on a zone
 	MsgKnockGranted    = "knock_granted"    // unicast: knock was granted
 	MsgKnockDenied     = "knock_denied"     // unicast: knock was denied
 	MsgKnockDecided    = "knock_decided"    // broadcast to room: a decision was made (dismiss notification on all occupants)
@@ -90,8 +90,8 @@ type ActiveKnockRequest struct {
 
 type WelcomePayload struct {
 	Me                  Player               `json:"me"`
-	Players             []Player             `json:"players"`              // others currently in the room
-	PendingKnocks       []PendingKnock       `json:"pending_knocks,omitempty"`       // requester: own outgoing knocks
+	Players             []Player             `json:"players"`                         // others currently in the room
+	PendingKnocks       []PendingKnock       `json:"pending_knocks,omitempty"`        // requester: own outgoing knocks
 	ActiveKnockRequests []ActiveKnockRequest `json:"active_knock_requests,omitempty"` // occupant: incoming knocks for this workspace
 }
 
@@ -175,8 +175,8 @@ type CapacityReachedPayload struct {
 // ServerDrainPayload is broadcast to all clients when the server is about to shut down.
 // Clients should begin reconnecting immediately; nginx will route them to a live instance.
 type ServerDrainPayload struct {
-	Reason            string `json:"reason"`             // always "server_shutdown"
-	ReconnectAfterMs  int    `json:"reconnect_after_ms"` // suggested reconnect delay in ms
+	Reason           string `json:"reason"`             // always "server_shutdown"
+	ReconnectAfterMs int    `json:"reconnect_after_ms"` // suggested reconnect delay in ms
 }
 
 // ForceSyncPayload tells a single client to snap its local player back to the
@@ -210,22 +210,22 @@ type KnockDeniedPayload struct {
 // ── Inbound message types (client → server) ───────────────────────────────────
 
 const (
-	ClientMsgMove        = "move"
-	ClientMsgChat        = "chat"
-	ClientMsgPing        = "ping"
-	ClientMsgStatus      = "status"
-	ClientMsgRoomEnter   = "room_enter"
-	ClientMsgRoomExit    = "room_exit"
-	ClientMsgWave        = "wave"
+	ClientMsgMove         = "move"
+	ClientMsgChat         = "chat"
+	ClientMsgPing         = "ping"
+	ClientMsgStatus       = "status"
+	ClientMsgRoomEnter    = "room_enter"
+	ClientMsgRoomExit     = "room_exit"
+	ClientMsgWave         = "wave"
 	ClientMsgFollow       = "follow"
 	ClientMsgStopFollower = "stop_follower" // followee → server: kick a specific follower
 	ClientMsgKnock        = "knock"
-	ClientMsgKnockDecide = "knock_decision"
-	ClientMsgKnockCancel = "knock_cancel"
-	ClientMsgMoveTo      = "move_to"  // path-based movement: client sends waypoints, server calculates duration
-	ClientMsgStop        = "stop"     // interrupt current path movement
-	ClientMsgHeartbeat   = "heartbeat"
-	ClientMsgSectionSync = "section_sync" // client→server→broadcast: notify peers of section state change
+	ClientMsgKnockDecide  = "knock_decision"
+	ClientMsgKnockCancel  = "knock_cancel"
+	ClientMsgMoveTo       = "move_to" // path-based movement: client sends waypoints, server calculates duration
+	ClientMsgStop         = "stop"    // interrupt current path movement
+	ClientMsgHeartbeat    = "heartbeat"
+	ClientMsgSectionSync  = "section_sync" // client→server→broadcast: notify peers of section state change
 )
 
 type ClientMovePayload struct {
@@ -312,6 +312,11 @@ type TilePoint struct {
 type ClientMoveToPayload struct {
 	Path      []TilePoint `json:"path"`
 	AvatarURL string      `json:"avatar_url"`
+	// Speed (px/s) the client is actually walking, including sprint. The server
+	// clamps it to [playerSpeed, playerSpeed*sprintMultiplier] before use, so peers
+	// interpolate at the same speed the mover sees locally. Zero/absent → base speed
+	// (backward compatible with clients that don't send it).
+	Speed float64 `json:"speed,omitempty"`
 }
 
 // ClientStopPayload is sent by the client to interrupt a path-based movement.
@@ -377,9 +382,10 @@ func encode(msgType string, payload any) ([]byte, error) {
 // Must stay in sync with zyra-app/zyra-engine/constants.ts.
 
 const (
-	tileSize    = 32    // px per tile — matches TILE_SIZE in constants.ts
-	playerSpeed = 120.0 // px per second — matches PLAYER_SPEED in constants.ts
-	maxPathLen  = 200   // max waypoints per move_to (anti-abuse)
+	tileSize         = 32    // px per tile — matches TILE_SIZE in constants.ts
+	playerSpeed      = 120.0 // px per second — matches PLAYER_SPEED in constants.ts
+	sprintMultiplier = 1.75  // max sprint factor — matches SPRINT_MULTIPLIER in constants.ts
+	maxPathLen       = 200   // max waypoints per move_to (anti-abuse)
 )
 
 // pathDistancePx calculates the total Euclidean distance (in px) along a path of tiles.
@@ -406,6 +412,20 @@ func pathDurationMs(path []TilePoint, speed float64) int {
 		return 0
 	}
 	return int(dist / speed * 1000)
+}
+
+// clampSpeed bounds a client-reported walk speed to the legal range.
+// Absent/zero or sub-base values fall back to the base walk speed; anything
+// above the max sprint speed is capped (anti-cheat).
+func clampSpeed(speed float64) float64 {
+	maxSpeed := playerSpeed * sprintMultiplier
+	if speed < playerSpeed {
+		return playerSpeed
+	}
+	if speed > maxSpeed {
+		return maxSpeed
+	}
+	return speed
 }
 
 // tileCenterPx returns the world-pixel center of a tile.

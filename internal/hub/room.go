@@ -424,12 +424,17 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 	c.TileY = dest.TileY
 	c.PX, c.PY = tileCenterPx(dest.TileX, dest.TileY)
 
-	durationMs := pathDurationMs(p.Path, playerSpeed)
+	// Honour the client's actual walk speed (sprint), but clamp it to the allowed
+	// range so a peer can't claim an impossible speed. This keeps every client's
+	// interpolation in step with the speed the mover walks locally — a sprinting
+	// player no longer drifts ahead on their own screen while peers render them slow.
+	speed := clampSpeed(p.Speed)
+	durationMs := pathDurationMs(p.Path, speed)
 
 	// Store active path so newly joined clients can resume interpolation.
 	c.MovePath = p.Path
 	c.MoveDurationMs = durationMs
-	c.MoveSpeed = playerSpeed
+	c.MoveSpeed = speed
 	c.MoveStartedAt = time.Now()
 	if durationMs == 0 {
 		return
@@ -439,7 +444,7 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 		UserID:       c.UserID,
 		Path:         p.Path,
 		DurationMs:   durationMs,
-		Speed:        playerSpeed,
+		Speed:        speed,
 		AvatarURL:    c.AvatarURL,
 		ServerTimeMs: c.MoveStartedAt.UnixMilli(),
 	}
@@ -536,7 +541,7 @@ func (r *Room) runMoveTicker() {
 	}
 }
 
-	// flushMoves drains pendingMoves and broadcasts each player's latest position
+// flushMoves drains pendingMoves and broadcasts each player's latest position
 // as a compact binary moved_bin frame (WebSocket BinaryMessage).
 // Latest-wins coalescing: if a player sent N moves since the last tick, only
 // the most recent position is sent — intermediate steps are intentionally dropped.

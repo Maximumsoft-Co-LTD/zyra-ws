@@ -51,9 +51,9 @@ type Client struct {
 	// MoveStartTX/TY stores the tile when the walk began so that unregister
 	// can persist the pre-move position on abrupt disconnect instead of the
 	// unreached destination tile.
-	IsMoving     bool
-	MoveStartTX  int
-	MoveStartTY  int
+	IsMoving    bool
+	MoveStartTX int
+	MoveStartTY int
 
 	// Active path movement state — retained so newly joined clients can pick up
 	// the in-progress walk and start interpolating from the correct point.
@@ -183,13 +183,29 @@ func (c *Client) Send(msg []byte) {
 }
 
 // SendBin enqueues a binary frame for the client's write pump.
-// Drops the message and closes the connection if the binary send buffer is full.
+//
+// Binary frames are idempotent, latest-wins position snapshots: each 20 ms tick
+// carries a player's newest position, so a lost frame is harmless — the next tick
+// supersedes it. Under a transient burst (a slow or briefly backgrounded peer at
+// 20 Hz × many movers) the buffer can fill momentarily. Dropping the WHOLE client
+// here — as the old code did — disconnects the user over a hiccup, forcing them to
+// refresh to recover the stream: the high-concurrency desync users reported.
+//
+// Instead, drop one stale frame and enqueue the newest. A genuinely dead client is
+// still reaped by the WritePump write deadline / ping-pong, so connections don't
+// leak. SendBin is only ever called from the single per-room move-ticker goroutine,
+// so this drain-and-replace is race-free for a given client.
 func (c *Client) SendBin(msg []byte) {
 	select {
 	case c.sendBin <- msg:
 	default:
-		slog.Warn("ws binary send buffer full — dropping client", "user_id", c.UserID)
-		c.room.unregister(c)
-		close(c.send) // close text channel to signal WritePump to exit
+		select {
+		case <-c.sendBin: // discard the oldest (now-stale) position
+		default:
+		}
+		select {
+		case c.sendBin <- msg:
+		default:
+		}
 	}
 }
