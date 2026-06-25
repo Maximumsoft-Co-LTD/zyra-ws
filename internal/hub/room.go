@@ -38,6 +38,10 @@ type Room struct {
 	pendingMoves  sync.Map // userID → pendingMoveEntry — latest position per player, flushed every 50ms
 	stopTick      chan struct{}
 	stopTickOnce  sync.Once
+	// followMu serialises follow-chain mutations (handleFollow/detach) and the
+	// server-driven cascade that walks hidden followers, so chain links and the
+	// followers' movement state are never mutated by two goroutines at once.
+	followMu sync.Mutex
 
 	// Obstacle grid for movement validation (bounds + blocked tiles). Loaded from
 	// Redis and refreshed every obstacleTTL so an owner's mid-session grid upload
@@ -114,14 +118,49 @@ func (r *Room) register(c *Client) {
 		}
 	}
 
+	// Restore follow chain from Redis if the user reconnected quickly enough.
+	var followTargetID string
+	if s := r.redisStore(); s != nil {
+		if savedTarget, err := s.GetFollow(ctx, r.workspaceID, c.UserID); err == nil && savedTarget != "" {
+			if target, ok := r.getClient(savedTarget); ok {
+				r.followMu.Lock()
+				tail := r.resolveTail(target)
+				if tail.UserID != c.UserID {
+					c.FollowTargetID = tail.UserID
+					tail.FollowerID = c.UserID
+					r.persistFollow(c, tail.UserID)
+					followTargetID = tail.UserID
+					r.sendMsg(tail, MsgFollowStarted, followPayload(c, true))
+				}
+				r.followMu.Unlock()
+			}
+			// Clean up the reconnect key now that we consumed it.
+			_ = s.DeleteFollow(ctx, r.workspaceID, c.UserID)
+		}
+	}
+
 	// Send welcome to the new client with full state snapshot.
-	if msg, err := encode(MsgWelcome, WelcomePayload{
+	welcome := WelcomePayload{
 		Me:                  c.Player(),
 		Players:             others,
 		PendingKnocks:       pendingKnocks,
 		ActiveKnockRequests: activeKnockRequests,
-	}); err == nil {
+		FollowTargetID:      followTargetID,
+	}
+	if msg, err := encode(MsgWelcome, welcome); err == nil {
 		c.Send(msg)
+	}
+
+	// If the follow chain was restored, tell the reconnected client which node
+	// to walk behind (same as handleFollow does for new follows).
+	if followTargetID != "" {
+		r.followMu.Lock()
+		leader := r.resolveLeader(c)
+		r.followMu.Unlock()
+		r.sendMsg(c, MsgFollowAssigned, FollowAssignedPayload{
+			TargetUserID: followTargetID,
+			ChainLeader:  leader.UserID,
+		})
 	}
 
 	// Broadcast joined event to all others.
@@ -143,6 +182,14 @@ func (r *Room) unregister(c *Client) {
 
 	slog.Info("ws room leave", "workspace_id", r.workspaceID, "user_id", c.UserID, "online", r.count())
 
+	// Heal the follow chain: re-link this client's neighbours so a mid-chain
+	// disconnect doesn't strand the trailing followers (Follower 2 leaves ->
+	// Follower 3 retargets Follower 1). Runs before AOI/Redis cleanup; c is already
+	// out of the clients map but its neighbours are still connected.
+	r.followMu.Lock()
+	r.detach(c)
+	r.followMu.Unlock()
+
 	// Remove from AOI grid so departing player stops receiving broadcasts.
 	r.aoi.Remove(c.UserID)
 
@@ -160,7 +207,9 @@ func (r *Room) unregister(c *Client) {
 		}
 		_ = s.DeletePresence(ctx, r.workspaceID, c.UserID)
 		_ = s.ClearRoom(ctx, r.workspaceID, c.UserID)
-		_ = s.DeleteFollow(ctx, r.workspaceID, c.UserID)
+		// Keep the follow target in Redis briefly so a quick reconnect can
+		// restore the chain instead of forcing the user to re-follow.
+		_ = s.ExpireFollow(ctx, r.workspaceID, c.UserID)
 		_ = s.DeletePosSnapshot(ctx, r.workspaceID, c.UserID)
 	}
 
@@ -215,6 +264,8 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 		r.handleHeartbeat(c)
 	case ClientMsgSectionSync:
 		r.handleSectionSync(c, env.Payload)
+	case ClientMsgVisibility:
+		r.handleVisibility(c, env.Payload)
 	default:
 		r.sendError(c, "unknown message type: "+env.Type)
 	}
@@ -229,6 +280,9 @@ func absInt(n int) int {
 }
 
 func (r *Room) handleMove(c *Client, payload json.RawMessage) {
+	if c.Hidden && c.FollowTargetID != "" {
+		return // server-driven while hidden
+	}
 	var p ClientMovePayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		r.sendError(c, "invalid move payload")
@@ -343,6 +397,11 @@ func currentPathTile(path []TilePoint, durationMs int, startedAt time.Time) Tile
 // duration from the path distance and player speed, then broadcasts a "moving"
 // event to all peers so they can interpolate the position locally.
 func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
+	// A hidden follower is walked by the server (cascadeHiddenFollowers); ignore any
+	// stale self-move it may emit so the two drivers never fight over its position.
+	if c.Hidden && c.FollowTargetID != "" {
+		return
+	}
 	var p ClientMoveToPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		r.sendError(c, "invalid move_to payload")
@@ -459,6 +518,15 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 
 	r.aoi.Move(c, c.TileX, c.TileY)
 
+	// Drive any backgrounded followers behind this mover one tile behind, mirroring
+	// this path — keeps the chain moving when a middle node is hidden.
+	slog.Info("[move_to] cascade check",
+		"mover", c.UserID,
+		"followerID", c.FollowerID,
+		"moverHidden", c.Hidden,
+	)
+	r.cascadeHiddenFollowers(c, p.Path)
+
 	// Throttled Redis snapshot for reconnect/new-joiner state.
 	if s := r.redisStore(); s != nil && time.Since(c.lastSnapAt) >= time.Second {
 		c.lastSnapAt = time.Now()
@@ -477,6 +545,9 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 // The client sends their current position; the server broadcasts a "stopped"
 // event so peers can halt the ongoing path interpolation at the correct spot.
 func (r *Room) handleStop(c *Client, payload json.RawMessage) {
+	if c.Hidden && c.FollowTargetID != "" {
+		return // server-driven while hidden
+	}
 	var p ClientStopPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
 		r.sendError(c, "invalid stop payload")
@@ -518,6 +589,49 @@ func (r *Room) handleStop(c *Client, payload json.RawMessage) {
 	}
 
 	r.aoi.Move(c, c.TileX, c.TileY)
+
+	// Cascade stop to hidden followers so they halt at their current position
+	// instead of continuing a stale server-driven walk.
+	r.cascadeHiddenFollowersStop(c)
+}
+
+// cascadeHiddenFollowersStop broadcasts a "stopped" for each hidden follower
+// behind the mover so peers halt their interpolation. Without this, a hidden
+// follower's last server-driven "moving" would play out to its full duration
+// while the mover has already stopped.
+func (r *Room) cascadeHiddenFollowersStop(mover *Client) {
+	r.followMu.Lock()
+	defer r.followMu.Unlock()
+	node := mover
+	for i := 0; i < maxFollowChain; i++ {
+		if node.FollowerID == "" {
+			return
+		}
+		f, ok := r.getClient(node.FollowerID)
+		if !ok || !f.Hidden {
+			return
+		}
+		if f.IsMoving && len(f.MovePath) >= 2 {
+			cur := currentPathTile(f.MovePath, f.MoveDurationMs, f.MoveStartedAt)
+			f.TileX = cur.TileX
+			f.TileY = cur.TileY
+			f.PX, f.PY = tileCenterPx(cur.TileX, cur.TileY)
+		}
+		f.IsMoving = false
+		f.MovePath = nil
+		if msg, err := encode(MsgStopped, StoppedPayload{
+			UserID:    f.UserID,
+			TileX:     f.TileX,
+			TileY:     f.TileY,
+			PX:        f.PX,
+			PY:        f.PY,
+			Direction: f.Direction,
+			Sitting:   f.Sitting,
+		}); err == nil {
+			r.broadcastExcept(msg, f.UserID)
+		}
+		node = f
+	}
 }
 
 // runMoveTicker flushes buffered moves to peers every 20ms (was 50ms).
@@ -724,6 +838,119 @@ func (r *Room) handleWave(c *Client, payload json.RawMessage) {
 	}
 }
 
+// maxFollowChain bounds chain traversal so a corrupt cycle can never spin forever.
+const maxFollowChain = 256
+
+// sendMsg encodes and unicasts a message to one client (best-effort).
+func (r *Room) sendMsg(c *Client, msgType string, payload any) {
+	if msg, err := encode(msgType, payload); err == nil {
+		c.Send(msg)
+	}
+}
+
+// persistFollow mirrors a client's ahead-pointer to Redis (for reconnect resume).
+func (r *Room) persistFollow(c *Client, targetID string) {
+	if s := r.redisStore(); s != nil {
+		_ = s.SetFollow(context.Background(), r.workspaceID, c.UserID, targetID)
+	}
+}
+
+func followPayload(c *Client, following bool) FollowPayload {
+	return FollowPayload{
+		FollowerUserID: c.UserID,
+		FollowerName:   c.EffectiveName(),
+		FollowerAvatar: c.AvatarURL,
+		Following:      following,
+	}
+}
+
+// resolveTail walks DOWN the followedBy links to the last node in the chain.
+// Stale pointers (the next node already left) are repaired in place.
+func (r *Room) resolveTail(start *Client) *Client {
+	node := start
+	for i := 0; node.FollowerID != "" && i < maxFollowChain; i++ {
+		next, ok := r.getClient(node.FollowerID)
+		if !ok {
+			node.FollowerID = "" // repair dangling tail
+			break
+		}
+		node = next
+	}
+	return node
+}
+
+// resolveLeader walks UP the following links to the head of the chain.
+func (r *Room) resolveLeader(start *Client) *Client {
+	node := start
+	for i := 0; node.FollowTargetID != "" && i < maxFollowChain; i++ {
+		prev, ok := r.getClient(node.FollowTargetID)
+		if !ok {
+			node.FollowTargetID = ""
+			break
+		}
+		node = prev
+	}
+	return node
+}
+
+// detach removes c from its follow chain and heals the gap:
+//
+//	...ahead <- c <- behind...   becomes   ...ahead <- behind...
+//
+// The trailing node is re-pointed at the upstream neighbour (follow_assigned), or
+// told to stop if the chain head is gone (follow_revoked). Safe to call when c has
+// no links, and safe after c was removed from the clients map (disconnect path).
+func (r *Room) detach(c *Client) {
+	aheadID, behindID := c.FollowTargetID, c.FollowerID
+	if aheadID == "" && behindID == "" {
+		return
+	}
+
+	var ahead, behind *Client
+	if aheadID != "" {
+		ahead, _ = r.getClient(aheadID)
+	}
+	if behindID != "" {
+		behind, _ = r.getClient(behindID)
+	}
+
+	// Re-link the two neighbours directly to each other.
+	if ahead != nil {
+		ahead.FollowerID = behindID
+	}
+	if behind != nil {
+		behind.FollowTargetID = aheadID
+		r.persistFollow(behind, aheadID)
+	}
+
+	// Clear c's own links.
+	c.FollowTargetID = ""
+	c.FollowerID = ""
+	r.persistFollow(c, "")
+
+	// Update the node ahead about its direct-follower change (for follow badges).
+	if ahead != nil {
+		r.sendMsg(ahead, MsgFollowEnded, followPayload(c, false))
+		if behind != nil {
+			r.sendMsg(ahead, MsgFollowStarted, followPayload(behind, true))
+		}
+	}
+
+	// Heal the trailing node: follow the upstream neighbour, or stop if none.
+	if behind != nil {
+		if aheadID != "" {
+			r.sendMsg(behind, MsgFollowAssigned, FollowAssignedPayload{
+				TargetUserID: aheadID,
+				ChainLeader:  r.resolveLeader(behind).UserID,
+			})
+		} else {
+			r.sendMsg(behind, MsgFollowRevoked, followPayload(behind, false))
+		}
+	}
+}
+
+// handleFollow binds c into a follow chain. A new follower is appended at the TAIL
+// of the target's line instead of crowding the target directly.
 func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 	var p ClientFollowPayload
 	if err := json.Unmarshal(payload, &p); err != nil {
@@ -731,29 +958,15 @@ func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 		return
 	}
 
-	ctx := context.Background()
+	// Serialise with detach/cascade so chain links are never mutated concurrently.
+	r.followMu.Lock()
+	defer r.followMu.Unlock()
 
+	// Empty target = unfollow: leave the chain and heal it.
 	if p.TargetUserID == "" {
-		// Unfollow — notify the previous target (tracked in-memory) and clear state.
-		if prevID := c.FollowTargetID; prevID != "" {
-			if target, ok := r.getClient(prevID); ok {
-				if msg, err := encode(MsgFollowEnded, FollowPayload{
-					FollowerUserID: c.UserID,
-					FollowerName:   c.EffectiveName(),
-					FollowerAvatar: c.AvatarURL,
-					Following:      false,
-				}); err == nil {
-					target.Send(msg)
-				}
-			}
-			c.FollowTargetID = ""
-		}
-		if s := r.redisStore(); s != nil {
-			_ = s.SetFollow(ctx, r.workspaceID, c.UserID, "")
-		}
+		r.detach(c)
 		return
 	}
-
 	if p.TargetUserID == c.UserID {
 		r.sendError(c, "cannot follow yourself")
 		return
@@ -763,31 +976,37 @@ func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 		r.sendError(c, "target not in office")
 		return
 	}
-
 	// Respect the target's availability — busy and dnd users decline unsolicited follows.
 	if target.Status == "busy" || target.Status == "dnd" {
 		r.sendError(c, "user is not available for following")
 		return
 	}
 
-	// Track in-memory and persist to Redis.
-	c.FollowTargetID = p.TargetUserID
-	if s := r.redisStore(); s != nil {
-		_ = s.SetFollow(ctx, r.workspaceID, c.UserID, p.TargetUserID)
+	// Leave any current chain first. This also guarantees c is absent from the
+	// target's chain, so appending below can never create a cycle.
+	r.detach(c)
+
+	// Append to the TAIL of the target's follow-line (conga-line behaviour).
+	tail := r.resolveTail(target)
+	if tail.UserID == c.UserID {
+		return // resolved back to ourselves — nothing to do
 	}
 
-	if msg, err := encode(MsgFollowStarted, FollowPayload{
-		FollowerUserID: c.UserID,
-		FollowerName:   c.EffectiveName(),
-		FollowerAvatar: c.AvatarURL,
-		Following:      true,
-	}); err == nil {
-		target.Send(msg)
-	}
+	c.FollowTargetID = tail.UserID
+	tail.FollowerID = c.UserID
+	r.persistFollow(c, tail.UserID)
+
+	// Tell c which node to actually walk behind (the tail), plus the chain leader.
+	r.sendMsg(c, MsgFollowAssigned, FollowAssignedPayload{
+		TargetUserID: tail.UserID,
+		ChainLeader:  r.resolveLeader(c).UserID,
+	})
+	// Notify the tail that it gained a direct follower.
+	r.sendMsg(tail, MsgFollowStarted, followPayload(c, true))
 }
 
-// handleStopFollower lets the FOLLOWEE kick a specific follower.
-// The follower receives follow_revoked; the followee's follow_ended clears their bar.
+// handleStopFollower lets the FOLLOWEE kick a specific direct follower.
+// The follower leaves the chain (which heals around it) and receives follow_revoked.
 func (r *Room) handleStopFollower(c *Client, payload json.RawMessage) {
 	var p ClientStopFollowerPayload
 	if err := json.Unmarshal(payload, &p); err != nil || p.FollowerUserID == "" {
@@ -800,28 +1019,183 @@ func (r *Room) handleStopFollower(c *Client, payload json.RawMessage) {
 		return
 	}
 
-	// Clear follow state on the follower.
-	follower.FollowTargetID = ""
-	if s := r.redisStore(); s != nil {
-		ctx := context.Background()
-		_ = s.SetFollow(ctx, r.workspaceID, follower.UserID, "")
+	r.followMu.Lock()
+	defer r.followMu.Unlock()
+	// Only the direct followee may kick this follower.
+	if follower.FollowTargetID != c.UserID {
+		return
 	}
 
-	followPayload := FollowPayload{
-		FollowerUserID: follower.UserID,
-		FollowerName:   follower.EffectiveName(),
-		FollowerAvatar: follower.AvatarURL,
-		Following:      false,
+	// detach heals the chain (follower's trailing node reconnects to c) and notifies
+	// c via follow_ended/started. Then tell the kicked follower itself to stop.
+	r.detach(follower)
+	r.sendMsg(follower, MsgFollowRevoked, followPayload(follower, false))
+}
+
+// handleVisibility records the client's tab visibility (Page Visibility API). A
+// hidden follower is walked by the server (cascadeHiddenFollowers); on return it
+// resumes driving itself, so we snap it to its authoritative position first.
+func (r *Room) handleVisibility(c *Client, payload json.RawMessage) {
+	var p ClientVisibilityPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return
+	}
+	r.followMu.Lock()
+	changed := c.Hidden != p.Hidden
+	c.Hidden = p.Hidden
+	r.followMu.Unlock()
+	slog.Info("[visibility]",
+		"user", c.UserID,
+		"hidden", p.Hidden,
+		"changed", changed,
+		"followTarget", c.FollowTargetID,
+		"follower", c.FollowerID,
+	)
+	if changed && !p.Hidden && c.FollowTargetID != "" {
+		r.forceSync(c, "visibility_resume")
+	}
+}
+
+// cascadeHiddenFollowers walks the server-driven (hidden) followers behind `mover`
+// one tile behind it, mirroring the path the mover just travelled. It stops at the
+// first foreground follower, whose own client drives it reactively from the broadcast.
+// `path` is the tile path the mover just travelled (leader→tail order, >= 2 tiles).
+func (r *Room) cascadeHiddenFollowers(mover *Client, path []TilePoint) {
+	if len(path) < 2 {
+		return
+	}
+	r.followMu.Lock()
+	defer r.followMu.Unlock()
+
+	p := mover
+	travelled := path
+	for i := 0; i < maxFollowChain; i++ {
+		if p.FollowerID == "" {
+			slog.Info("[cascade] no follower", "node", p.UserID)
+			return
+		}
+		f, ok := r.getClient(p.FollowerID)
+		if !ok {
+			slog.Info("[cascade] follower not found", "followerID", p.FollowerID)
+			return
+		}
+		if !f.Hidden {
+			slog.Info("[cascade] follower is foreground — skipping",
+				"follower", f.UserID, "hidden", f.Hidden)
+			return
+		}
+		slog.Info("[cascade] driving hidden follower",
+			"follower", f.UserID, "predPath", len(travelled))
+		next := r.driveServerFollow(f, travelled)
+		if next == nil {
+			return
+		}
+		p = f
+		travelled = next
+	}
+}
+
+// driveServerFollow walks a hidden follower one tile behind its predecessor by
+// mirroring the predecessor's path minus its last tile. Broadcasts a "moving" for the
+// follower and returns the follower's own travelled path so the cascade can drive the
+// next hidden node. Returns nil if no movement was produced. Caller must hold followMu.
+func (r *Room) driveServerFollow(f *Client, predPath []TilePoint) []TilePoint {
+	if len(predPath) < 2 {
+		return nil
+	}
+	// The follower occupies the tiles the predecessor vacated (its path minus the
+	// final tile), ending one tile behind the predecessor.
+	vacated := predPath[:len(predPath)-1]
+	dest := vacated[len(vacated)-1]
+
+	// If the follower is still mid-walk from a previous server-driven movement,
+	// reconcile its authoritative position to where it actually is RIGHT NOW
+	// along that path. Without this, `start` would be the previous destination
+	// (set eagerly below) which peers haven't reached yet — the new movement
+	// would begin from a phantom tile and peers see a positional jump.
+	if f.IsMoving && len(f.MovePath) >= 2 {
+		cur := currentPathTile(f.MovePath, f.MoveDurationMs, f.MoveStartedAt)
+		f.TileX = cur.TileX
+		f.TileY = cur.TileY
+		f.PX, f.PY = tileCenterPx(cur.TileX, cur.TileY)
 	}
 
-	// Tell the follower to stop (follow_revoked).
-	if msg, err := encode(MsgFollowRevoked, followPayload); err == nil {
-		follower.Send(msg)
+	if f.TileX == dest.TileX && f.TileY == dest.TileY {
+		return nil // already one tile behind
 	}
-	// Confirm to the followee that the follow ended.
-	if msg, err := encode(MsgFollowEnded, followPayload); err == nil {
-		c.Send(msg)
+
+	start := TilePoint{TileX: f.TileX, TileY: f.TileY}
+	var fPath []TilePoint
+	switch {
+	case start.TileX == vacated[0].TileX && start.TileY == vacated[0].TileY:
+		fPath = vacated // already on the first vacated tile
+	case adjacentTiles(start, vacated[0]):
+		fPath = append([]TilePoint{start}, vacated...) // tight line — walk the trail
+	default:
+		// Fell behind / just backgrounded far. Without server-side A* we can't smoothly
+		// path around obstacles, so snap straight to one-behind. The follower's own
+		// screen is hidden; downstream peers just see a quick catch-up.
+		fPath = []TilePoint{start, dest}
 	}
+
+	prevTX, prevTY := f.TileX, f.TileY
+	if !f.IsMoving {
+		f.MoveStartTX, f.MoveStartTY = prevTX, prevTY
+	}
+	f.IsMoving = true
+	f.MovePath = fPath
+	f.MoveSpeed = playerSpeed
+	f.MoveDurationMs = pathDurationMs(fPath, playerSpeed)
+	f.MoveStartedAt = time.Now()
+	f.TileX, f.TileY = dest.TileX, dest.TileY
+	f.PX, f.PY = tileCenterPx(dest.TileX, dest.TileY)
+	f.Sitting = false
+	f.Direction = directionFromPath(fPath)
+
+	if f.MoveDurationMs > 0 {
+		if msg, err := encode(MsgMoving, MovingPayload{
+			UserID:       f.UserID,
+			Path:         fPath,
+			DurationMs:   f.MoveDurationMs,
+			Speed:        playerSpeed,
+			AvatarURL:    f.AvatarURL,
+			ServerTimeMs: f.MoveStartedAt.UnixMilli(),
+		}); err == nil {
+			r.broadcastExcept(msg, f.UserID)
+		}
+	}
+	r.aoi.Move(f, f.TileX, f.TileY)
+	return fPath
+}
+
+// directionFromPath derives a facing direction from the last two tiles of a path.
+func directionFromPath(path []TilePoint) string {
+	if len(path) < 2 {
+		return ""
+	}
+	prev := path[len(path)-2]
+	last := path[len(path)-1]
+	dx := last.TileX - prev.TileX
+	dy := last.TileY - prev.TileY
+	switch {
+	case dy < 0:
+		return "up"
+	case dy > 0:
+		return "down"
+	case dx < 0:
+		return "left"
+	case dx > 0:
+		return "right"
+	default:
+		return ""
+	}
+}
+
+// adjacentTiles reports whether a and b are within one tile (8-neighbourhood) and not equal.
+func adjacentTiles(a, b TilePoint) bool {
+	dx := absInt(a.TileX - b.TileX)
+	dy := absInt(a.TileY - b.TileY)
+	return dx <= 1 && dy <= 1 && dx+dy > 0
 }
 
 func (r *Room) handleKnock(c *Client, payload json.RawMessage) {
@@ -1147,11 +1521,12 @@ func (r *Room) forceSync(c *Client, reason string) {
 		px, py = tileCenterPx(c.TileX, c.TileY)
 	}
 	if msg, err := encode(MsgForceSync, ForceSyncPayload{
-		TileX:  c.TileX,
-		TileY:  c.TileY,
-		PX:     px,
-		PY:     py,
-		Reason: reason,
+		TileX:     c.TileX,
+		TileY:     c.TileY,
+		PX:        px,
+		PY:        py,
+		Direction: c.Direction,
+		Reason:    reason,
 	}); err == nil {
 		c.Send(msg)
 	}

@@ -111,7 +111,7 @@ func TestHandleStatus_CustomMsgTruncatedAt30Runes(t *testing.T) {
 	sender := newTestClient(r, "u1", "available")
 
 	longMsg := "あいうえおかきくけこさしすせそたちつてとなにぬねのはひ" // 28 runes, safe
-	tooLong := longMsg + "ふへほまみ"                                 // 33 runes, over limit
+	tooLong := longMsg + "ふへほまみ"             // 33 runes, over limit
 
 	payload := encodePayload(ClientStatusPayload{Status: "busy", CustomMsg: tooLong})
 	r.handleStatus(sender, payload)

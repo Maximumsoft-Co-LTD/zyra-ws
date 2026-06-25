@@ -27,6 +27,7 @@ const (
 	MsgFollowStarted   = "follow_started"   // unicast: target player is being followed
 	MsgFollowEnded     = "follow_ended"     // unicast: follower stopped following (sent to target)
 	MsgFollowRevoked   = "follow_revoked"   // unicast: target stopped the follow (sent to follower)
+	MsgFollowAssigned  = "follow_assigned"  // unicast: tells a follower which node to actually walk behind (chain tail / after heal)
 	MsgKnockRequest    = "knock_request"    // broadcast: someone knocked on a zone
 	MsgKnockGranted    = "knock_granted"    // unicast: knock was granted
 	MsgKnockDenied     = "knock_denied"     // unicast: knock was denied
@@ -93,6 +94,7 @@ type WelcomePayload struct {
 	Players             []Player             `json:"players"`                         // others currently in the room
 	PendingKnocks       []PendingKnock       `json:"pending_knocks,omitempty"`        // requester: own outgoing knocks
 	ActiveKnockRequests []ActiveKnockRequest `json:"active_knock_requests,omitempty"` // occupant: incoming knocks for this workspace
+	FollowTargetID      string               `json:"follow_target_id,omitempty"`      // restored follow chain target (reconnect)
 }
 
 type JoinedPayload struct {
@@ -168,6 +170,15 @@ type FollowPayload struct {
 	Following      bool   `json:"following"` // true=started, false=ended
 }
 
+// FollowAssignedPayload tells a follower which node it should actually walk behind.
+// In a follow chain a new follower is appended at the TAIL (not bound to the clicked
+// target), and when a middle node leaves the trailing node is re-pointed at the gap's
+// upstream neighbour — both cases are communicated with this message.
+type FollowAssignedPayload struct {
+	TargetUserID string `json:"target_user_id"` // the node directly ahead to walk behind
+	ChainLeader  string `json:"chain_leader"`   // head of the whole line (for UI labelling)
+}
+
 type CapacityReachedPayload struct {
 	Message string `json:"message"`
 }
@@ -184,11 +195,12 @@ type ServerDrainPayload struct {
 // malformed path, desynced start) so the client cannot keep a position the
 // server never accepted.
 type ForceSyncPayload struct {
-	TileX  int     `json:"tile_x"`
-	TileY  int     `json:"tile_y"`
-	PX     float64 `json:"px"`
-	PY     float64 `json:"py"`
-	Reason string  `json:"reason,omitempty"`
+	TileX     int     `json:"tile_x"`
+	TileY     int     `json:"tile_y"`
+	PX        float64 `json:"px"`
+	PY        float64 `json:"py"`
+	Direction string  `json:"direction,omitempty"`
+	Reason    string  `json:"reason,omitempty"`
 }
 
 // KnockDecidedPayload is broadcast to all room occupants so they can dismiss the notification.
@@ -226,7 +238,13 @@ const (
 	ClientMsgStop         = "stop"    // interrupt current path movement
 	ClientMsgHeartbeat    = "heartbeat"
 	ClientMsgSectionSync  = "section_sync" // client→server→broadcast: notify peers of section state change
+	ClientMsgVisibility   = "visibility"   // client→server: tab hidden/visible (drives server-authoritative follow)
 )
+
+// ClientVisibilityPayload reports the tab's Page-Visibility state.
+type ClientVisibilityPayload struct {
+	Hidden bool `json:"hidden"`
+}
 
 type ClientMovePayload struct {
 	TileX     int     `json:"tile_x"`
@@ -385,6 +403,7 @@ const (
 	tileSize         = 32    // px per tile — matches TILE_SIZE in constants.ts
 	playerSpeed      = 120.0 // px per second — matches PLAYER_SPEED in constants.ts
 	sprintMultiplier = 1.75  // max sprint factor — matches SPRINT_MULTIPLIER in constants.ts
+	followCatchupMax = 2.5   // max follow catch-up factor — matches FOLLOW_CATCHUP_MULTIPLIER in constants.ts
 	maxPathLen       = 200   // max waypoints per move_to (anti-abuse)
 )
 
@@ -415,10 +434,11 @@ func pathDurationMs(path []TilePoint, speed float64) int {
 }
 
 // clampSpeed bounds a client-reported walk speed to the legal range.
-// Absent/zero or sub-base values fall back to the base walk speed; anything
-// above the max sprint speed is capped (anti-cheat).
+// Absent/zero or sub-base values fall back to the base walk speed; anything above
+// the max follow catch-up speed is capped (anti-cheat). The ceiling is the catch-up
+// max (not sprint) so a lagging follower can out-pace the leader to close the gap.
 func clampSpeed(speed float64) float64 {
-	maxSpeed := playerSpeed * sprintMultiplier
+	maxSpeed := playerSpeed * followCatchupMax
 	if speed < playerSpeed {
 		return playerSpeed
 	}

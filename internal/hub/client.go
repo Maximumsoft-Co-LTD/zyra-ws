@@ -2,6 +2,7 @@ package hub
 
 import (
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,11 +24,12 @@ const (
 
 // Client represents a single WebSocket connection inside a Room.
 type Client struct {
-	hub     *Hub
-	room    *Room
-	conn    *websocket.Conn
-	send    chan []byte // buffered outbound JSON (TextMessage)
-	sendBin chan []byte // buffered outbound binary frames (BinaryMessage)
+	hub       *Hub
+	room      *Room
+	conn      *websocket.Conn
+	send      chan []byte // buffered outbound JSON (TextMessage)
+	sendBin   chan []byte // buffered outbound binary frames (BinaryMessage)
+	closeOnce sync.Once   // ensures send channel is closed at most once
 
 	UserID        string
 	DisplayName   string
@@ -42,10 +44,19 @@ type Client struct {
 	RoomID        string
 	Direction     string
 	Sitting       bool
-	// FollowTargetID is the user_id this client is currently following.
-	// Tracked in-memory so the unfollow handler can notify the previous target
-	// without an extra Redis round-trip.
+	// Follow chain (doubly-linked list). The chain is a single line:
+	//   Leader <- F1 <- F2 <- F3(tail)   (new followers append at the tail)
+	// FollowTargetID = the node directly AHEAD (the one this client walks behind).
+	// FollowerID     = the node directly BEHIND (at most one — the chain is linear).
+	// Tracked in-memory so detach/heal can re-link neighbours without a Redis round-trip.
 	FollowTargetID string
+	FollowerID     string
+
+	// Hidden is true while the client's tab is backgrounded (Page Visibility). A
+	// hidden follower can't drive its own movement (its rAF/timers are paused), so
+	// the server takes over walking it behind its predecessor — this keeps a chain
+	// alive when a middle node is backgrounded (otherwise everyone behind it freezes).
+	Hidden bool
 
 	// IsMoving is true while the player is walking a path (between move_to and stop).
 	// MoveStartTX/TY stores the tile when the walk began so that unregister
@@ -171,14 +182,15 @@ func (c *Client) EffectiveName() string {
 }
 
 // Send enqueues a JSON message for the client's write pump.
-// Drops the message and closes the connection if the send buffer is full.
+// If the send buffer is full the client is unregistered and the send channel
+// is closed exactly once (via closeOnce) to signal WritePump to exit.
 func (c *Client) Send(msg []byte) {
 	select {
 	case c.send <- msg:
 	default:
 		slog.Warn("ws send buffer full — dropping client", "user_id", c.UserID)
 		c.room.unregister(c)
-		close(c.send)
+		c.closeOnce.Do(func() { close(c.send) })
 	}
 }
 

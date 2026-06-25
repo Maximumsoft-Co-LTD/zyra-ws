@@ -244,7 +244,30 @@ func (s *RedisStore) SetFollow(ctx context.Context, wsID, followerID, targetID s
 	return s.rdb.Set(ctx, followKey(wsID, followerID), targetID, 0).Err()
 }
 
-// DeleteFollow clears the follow state on disconnect.
+// GetFollow returns the persisted follow target for a reconnecting user.
+func (s *RedisStore) GetFollow(ctx context.Context, wsID, followerID string) (string, error) {
+	if !s.available() {
+		return "", nil
+	}
+	val, err := s.rdb.Get(ctx, followKey(wsID, followerID)).Result()
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// ExpireFollow sets a short TTL on the follow key so a quick reconnect can
+// restore the chain, but stale keys are garbage-collected otherwise.
+const followReconnectTTL = 30 * time.Second
+
+func (s *RedisStore) ExpireFollow(ctx context.Context, wsID, followerID string) error {
+	if !s.available() {
+		return nil
+	}
+	return s.rdb.Expire(ctx, followKey(wsID, followerID), followReconnectTTL).Err()
+}
+
+// DeleteFollow clears the follow state immediately.
 func (s *RedisStore) DeleteFollow(ctx context.Context, wsID, followerID string) error {
 	if !s.available() {
 		return nil
@@ -265,10 +288,11 @@ func (s *RedisStore) SetLastPosition(ctx context.Context, wsID, userID string, t
 	if !s.available() {
 		return nil
 	}
-	return s.rdb.HSet(ctx, lastPosKey(wsID, userID),
-		"tile_x", tileX,
-		"tile_y", tileY,
-	).Err()
+	key := lastPosKey(wsID, userID)
+	if err := s.rdb.HSet(ctx, key, "tile_x", tileX, "tile_y", tileY).Err(); err != nil {
+		return err
+	}
+	return s.rdb.Expire(ctx, key, lastPosTTL).Err()
 }
 
 // GetLastPosition retrieves the user's last recorded tile position (0,0 if not set).
