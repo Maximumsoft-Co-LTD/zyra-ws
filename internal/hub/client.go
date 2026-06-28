@@ -82,19 +82,20 @@ type Client struct {
 // Player converts the client's current state into a Player DTO.
 func (c *Client) Player() Player {
 	p := Player{
-		UserID:        c.UserID,
-		DisplayName:   c.DisplayName,
-		CharacterName: c.CharacterName,
-		AvatarURL:     c.AvatarURL,
-		TileX:         c.TileX,
-		TileY:         c.TileY,
-		PX:            c.PX,
-		PY:            c.PY,
-		Status:        c.Status,
-		CustomMsg:     c.CustomMsg,
-		RoomID:        c.RoomID,
-		Direction:     c.Direction,
-		Sitting:       c.Sitting,
+		UserID:         c.UserID,
+		DisplayName:    c.DisplayName,
+		CharacterName:  c.CharacterName,
+		AvatarURL:      c.AvatarURL,
+		TileX:          c.TileX,
+		TileY:          c.TileY,
+		PX:             c.PX,
+		PY:             c.PY,
+		Status:         c.Status,
+		CustomMsg:      c.CustomMsg,
+		RoomID:         c.RoomID,
+		Direction:      c.Direction,
+		Sitting:        c.Sitting,
+		FollowTargetID: c.FollowTargetID,
 	}
 	if c.IsMoving && len(c.MovePath) >= 2 {
 		elapsed := int(time.Since(c.MoveStartedAt).Milliseconds())

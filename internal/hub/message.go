@@ -28,6 +28,7 @@ const (
 	MsgFollowEnded     = "follow_ended"     // unicast: follower stopped following (sent to target)
 	MsgFollowRevoked   = "follow_revoked"   // unicast: target stopped the follow (sent to follower)
 	MsgFollowAssigned  = "follow_assigned"  // unicast: tells a follower which node to actually walk behind (chain tail / after heal)
+	MsgFollowChanged   = "follow_changed"   // broadcast: a player's follow_target_id changed (for UI hints)
 	MsgKnockRequest    = "knock_request"    // broadcast: someone knocked on a zone
 	MsgKnockGranted    = "knock_granted"    // unicast: knock was granted
 	MsgKnockDenied     = "knock_denied"     // unicast: knock was denied
@@ -61,6 +62,9 @@ type Player struct {
 	RoomID        string  `json:"room_id,omitempty"`
 	Direction     string  `json:"direction,omitempty"`
 	Sitting       bool    `json:"sitting,omitempty"`
+
+	// Follow chain — included so other clients can display chain leader in UI.
+	FollowTargetID string `json:"follow_target_id,omitempty"`
 
 	// Active path movement — populated only when the player is mid-walk so
 	// newly joined clients can start interpolating from the correct point.
@@ -135,8 +139,12 @@ type StatusChangedPayload struct {
 }
 
 type RoomChangedPayload struct {
-	UserID string `json:"user_id"`
-	RoomID string `json:"room_id"` // empty = exited
+	UserID string  `json:"user_id"`
+	RoomID string  `json:"room_id"`          // empty = exited
+	TileX  int     `json:"tile_x,omitempty"` // included on exit so peers place correctly
+	TileY  int     `json:"tile_y,omitempty"`
+	PX     float64 `json:"px,omitempty"`
+	PY     float64 `json:"py,omitempty"`
 }
 
 type WaveReceivedPayload struct {
@@ -177,6 +185,12 @@ type FollowPayload struct {
 type FollowAssignedPayload struct {
 	TargetUserID string `json:"target_user_id"` // the node directly ahead to walk behind
 	ChainLeader  string `json:"chain_leader"`   // head of the whole line (for UI labelling)
+}
+
+// FollowChangedPayload is broadcast to all clients when someone's follow target changes.
+type FollowChangedPayload struct {
+	UserID         string `json:"user_id"`
+	FollowTargetID string `json:"follow_target_id"` // empty = stopped following
 }
 
 type CapacityReachedPayload struct {

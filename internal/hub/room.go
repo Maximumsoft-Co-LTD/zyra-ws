@@ -43,6 +43,13 @@ type Room struct {
 	// followers' movement state are never mutated by two goroutines at once.
 	followMu sync.Mutex
 
+	// lifecycleMu serialises the register/unregister critical section so two
+	// simultaneous joins (or a join coinciding with a leave) can't interleave
+	// between the peer-snapshot and the joined/left broadcast. Without it, two
+	// clients connecting at the same instant can each miss the other's presence:
+	// one sees both players, the other sees only itself (asymmetric presence).
+	lifecycleMu sync.Mutex
+
 	// Obstacle grid for movement validation (bounds + blocked tiles). Loaded from
 	// Redis and refreshed every obstacleTTL so an owner's mid-session grid upload
 	// propagates without recreating the room. nil = no grid → validation disabled.
@@ -66,6 +73,14 @@ func (r *Room) register(c *Client) {
 	// AFTER storing the new client. The close must happen after Store so that
 	// the old goroutine's unregister call hits the CompareAndDelete guard and
 	// returns early, preventing a phantom "left" broadcast.
+	// Serialise the whole register sequence (peer snapshot → store → joined
+	// broadcast) against concurrent register/unregister so a simultaneous join
+	// can never lose its joined broadcast or be absent from the peer's welcome
+	// snapshot. Held across the welcome/follow restore too so the trailing
+	// joined broadcast still carries the restored FollowTargetID.
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
 	var oldClient *Client
 	if old, ok := r.clients.Load(c.UserID); ok {
 		oldClient = old.(*Client)
@@ -171,6 +186,11 @@ func (r *Room) register(c *Client) {
 
 // unregister removes a client and broadcasts a left event.
 func (r *Room) unregister(c *Client) {
+	// Serialise with register so the delete + left broadcast can't interleave
+	// between a concurrent join's peer-snapshot and its joined broadcast.
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
 	// Guard: only unregister if this exact client instance is still registered.
 	// This prevents a stale goroutine (from a previous connection of the same user)
 	// from evicting a newer reconnected client and emitting a phantom "left" event.
@@ -451,11 +471,15 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 		return
 	}
 
-	// Lenient wall/bounds validation: only the destination tile is checked.
-	// If it is out of bounds or blocked, reject and snap the client back.
+	// Wall/bounds validation: check destination + wall-edge crossings.
+	grid := r.getObstacleGrid()
 	dest := p.Path[len(p.Path)-1]
-	if r.tileBlocked(r.getObstacleGrid(), dest.TileX, dest.TileY) {
+	if r.tileBlocked(grid, dest.TileX, dest.TileY) {
 		r.forceSync(c, "blocked_dest")
+		return
+	}
+	if r.pathCrossesWall(grid, p.Path) {
+		r.forceSync(c, "wall_crossing")
 		return
 	}
 
@@ -769,7 +793,16 @@ func (r *Room) handleRoomExit(c *Client, _ json.RawMessage) {
 		_ = s.ClearRoom(context.Background(), r.workspaceID, c.UserID)
 	}
 
-	if msg, err := encode(MsgRoomExited, RoomChangedPayload{UserID: c.UserID, RoomID: ""}); err == nil {
+	// Include current position so peers can place the player correctly when
+	// their sprite reappears (prevents a brief snap to stale pre-room position).
+	if msg, err := encode(MsgRoomExited, RoomChangedPayload{
+		UserID: c.UserID,
+		RoomID: "",
+		TileX:  c.TileX,
+		TileY:  c.TileY,
+		PX:     c.PX,
+		PY:     c.PY,
+	}); err == nil {
 		r.broadcastExcept(msg, c.UserID)
 	}
 }
@@ -852,6 +885,15 @@ func (r *Room) sendMsg(c *Client, msgType string, payload any) {
 func (r *Room) persistFollow(c *Client, targetID string) {
 	if s := r.redisStore(); s != nil {
 		_ = s.SetFollow(context.Background(), r.workspaceID, c.UserID, targetID)
+	}
+}
+
+func (r *Room) broadcastFollowChanged(c *Client) {
+	if msg, err := encode(MsgFollowChanged, FollowChangedPayload{
+		UserID:         c.UserID,
+		FollowTargetID: c.FollowTargetID,
+	}); err == nil {
+		r.broadcast(msg)
 	}
 }
 
@@ -943,10 +985,15 @@ func (r *Room) detach(c *Client) {
 				TargetUserID: aheadID,
 				ChainLeader:  r.resolveLeader(behind).UserID,
 			})
+			r.broadcastFollowChanged(behind)
 		} else {
 			r.sendMsg(behind, MsgFollowRevoked, followPayload(behind, false))
+			r.broadcastFollowChanged(behind)
 		}
 	}
+
+	// Broadcast c's follow_target cleared.
+	r.broadcastFollowChanged(c)
 }
 
 // handleFollow binds c into a follow chain. A new follower is appended at the TAIL
@@ -982,6 +1029,10 @@ func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 		return
 	}
 
+	// Remember who was following c BEFORE detaching, so we can re-attach them
+	// to c in the new chain (conga-line stays intact when a middle node re-targets).
+	oldFollowerID := c.FollowerID
+
 	// Leave any current chain first. This also guarantees c is absent from the
 	// target's chain, so appending below can never create a cycle.
 	r.detach(c)
@@ -1003,6 +1054,44 @@ func (r *Room) handleFollow(c *Client, payload json.RawMessage) {
 	})
 	// Notify the tail that it gained a direct follower.
 	r.sendMsg(tail, MsgFollowStarted, followPayload(c, true))
+
+	// Broadcast to all: c's follow target changed (for context menu UI hints).
+	r.broadcastFollowChanged(c)
+
+	// Re-attach the old follower behind c so the chain stays connected.
+	// Example: A→B, then B follows C → chain should become C←B←A, not C←B + A revoked.
+	// Guard: skip if the old follower is already part of the new chain (prevent cycles).
+	if oldFollowerID != "" && oldFollowerID != target.UserID {
+		// Walk the new chain upward from c to check the old follower isn't already in it.
+		inChain := false
+		node := c
+		for i := 0; node.FollowTargetID != "" && i < maxFollowChain; i++ {
+			if node.FollowTargetID == oldFollowerID {
+				inChain = true
+				break
+			}
+			n, ok := r.getClient(node.FollowTargetID)
+			if !ok {
+				break
+			}
+			node = n
+		}
+		if !inChain {
+			behind, ok := r.getClient(oldFollowerID)
+			if ok && behind.FollowTargetID == "" {
+				// behind was revoked by detach — re-link it behind c.
+				behind.FollowTargetID = c.UserID
+				c.FollowerID = behind.UserID
+				r.persistFollow(behind, c.UserID)
+				r.sendMsg(behind, MsgFollowAssigned, FollowAssignedPayload{
+					TargetUserID: c.UserID,
+					ChainLeader:  r.resolveLeader(behind).UserID,
+				})
+				r.sendMsg(c, MsgFollowStarted, followPayload(behind, true))
+				r.broadcastFollowChanged(behind)
+			}
+		}
+	}
 }
 
 // handleStopFollower lets the FOLLOWEE kick a specific direct follower.
@@ -1508,6 +1597,79 @@ func (r *Room) tileBlocked(g *store.ObstacleGrid, tx, ty int) bool {
 		if _, ok := g.Blocked[fmt.Sprintf("%d,%d", tx, ty)]; ok {
 			return true
 		}
+	}
+	return false
+}
+
+// pathCrossesWall checks whether any step in the tile path crosses a wall edge.
+// Validates both: exiting a wall tile through its blocked side, and entering a
+// wall tile from its blocked (hard-approach) side.
+func (r *Room) pathCrossesWall(g *store.ObstacleGrid, path []TilePoint) bool {
+	if g == nil || len(g.Walls) == 0 || len(path) < 2 {
+		return false
+	}
+	for i := 0; i < len(path)-1; i++ {
+		dx := path[i+1].TileX - path[i].TileX
+		dy := path[i+1].TileY - path[i].TileY
+
+		// Check exit: wall on the source tile blocks leaving in that direction
+		fromKey := fmt.Sprintf("%d,%d", path[i].TileX, path[i].TileY)
+		if wallDir, ok := g.Walls[fromKey]; ok {
+			if isWallBlockedExitGo(wallDir, dx, dy) {
+				return true
+			}
+		}
+
+		// Check entry: wall on the destination tile blocks approach from this direction
+		toKey := fmt.Sprintf("%d,%d", path[i+1].TileX, path[i+1].TileY)
+		if wallDir, ok := g.Walls[toKey]; ok {
+			if isWallHardApproachGo(wallDir, dx, dy) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isWallHardApproachGo checks if entering a wall tile from direction (dx,dy) is blocked.
+// Mirrors client-side isWallHardApproach: wall blocks approach FROM its own side.
+func isWallHardApproachGo(wallDir string, dx, dy int) bool {
+	hasTop := wallDir == "top" || wallDir == "top_left" || wallDir == "top_right"
+	hasBottom := wallDir == "bottom" || wallDir == "bottom_left" || wallDir == "bottom_right"
+	hasLeft := wallDir == "left" || wallDir == "top_left" || wallDir == "bottom_left"
+	hasRight := wallDir == "right" || wallDir == "top_right" || wallDir == "bottom_right"
+	if dy > 0 && hasTop {
+		return true
+	}
+	if dy < 0 && hasBottom {
+		return true
+	}
+	if dx > 0 && hasLeft {
+		return true
+	}
+	if dx < 0 && hasRight {
+		return true
+	}
+	return false
+}
+
+// isWallBlockedExitGo checks if exiting in direction (dx,dy) is blocked by wallDir.
+func isWallBlockedExitGo(wallDir string, dx, dy int) bool {
+	hasTop := wallDir == "top" || wallDir == "top_left" || wallDir == "top_right"
+	hasBottom := wallDir == "bottom" || wallDir == "bottom_left" || wallDir == "bottom_right"
+	hasLeft := wallDir == "left" || wallDir == "top_left" || wallDir == "bottom_left"
+	hasRight := wallDir == "right" || wallDir == "top_right" || wallDir == "bottom_right"
+	if dx > 0 && hasRight {
+		return true
+	}
+	if dx < 0 && hasLeft {
+		return true
+	}
+	if dy < 0 && hasTop {
+		return true
+	}
+	if dy > 0 && hasBottom {
+		return true
 	}
 	return false
 }

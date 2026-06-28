@@ -41,7 +41,10 @@ func Load() Config {
 		}
 	}
 
-	capacity := 50
+	// Fallback used only when the API doesn't send a per-workspace capacity
+	// (query param 0/absent). The real gate is tb_workspace.capacity. Default
+	// kept high enough that an unconfigured workspace can still host a full room.
+	capacity := 100
 	if v := os.Getenv("DEFAULT_CAPACITY"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			capacity = n

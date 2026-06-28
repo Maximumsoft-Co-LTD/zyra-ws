@@ -518,18 +518,22 @@ func obstacleKey(wsID string) string {
 }
 
 // ObstacleGrid is the per-workspace movement grid (tile units). Blocked is a set
-// of "x,y" tile keys for O(1) lookup. A nil grid means "no data" → no validation.
+// of "x,y" tile keys for O(1) lookup. Walls maps "x,y" → direction string for
+// edge-based collision (can stand on but not pass through). A nil grid means
+// "no data" → no validation.
 type ObstacleGrid struct {
 	W       int
 	H       int
 	Blocked map[string]struct{}
+	Walls   map[string]string // key "x,y" → wall direction (e.g. "right", "top_left")
 }
 
 // obstacleGridJSON matches the JSON shape written by zyra-api's cache.ObstacleGrid.
 type obstacleGridJSON struct {
-	W       int      `json:"w"`
-	H       int      `json:"h"`
-	Blocked []string `json:"blocked"`
+	W       int               `json:"w"`
+	H       int               `json:"h"`
+	Blocked []string          `json:"blocked"`
+	Walls   map[string]string `json:"walls,omitempty"`
 }
 
 // GetWorkspaceObstacles reads and parses the obstacle grid for a workspace.
@@ -550,9 +554,17 @@ func (s *RedisStore) GetWorkspaceObstacles(ctx context.Context, wsID string) (*O
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, err
 	}
-	grid := &ObstacleGrid{W: parsed.W, H: parsed.H, Blocked: make(map[string]struct{}, len(parsed.Blocked))}
+	grid := &ObstacleGrid{
+		W:       parsed.W,
+		H:       parsed.H,
+		Blocked: make(map[string]struct{}, len(parsed.Blocked)),
+		Walls:   parsed.Walls,
+	}
 	for _, k := range parsed.Blocked {
 		grid.Blocked[k] = struct{}{}
+	}
+	if grid.Walls == nil {
+		grid.Walls = make(map[string]string)
 	}
 	return grid, nil
 }
