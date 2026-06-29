@@ -39,6 +39,20 @@ const (
 	MsgWaveAnimation   = "wave_animation"   // broadcast: show wave animation on sender's avatar
 	MsgServerDrain     = "server_drain"     // broadcast: server is shutting down — client should reconnect
 	MsgForceSync       = "force_sync"       // unicast: server corrects the client's position (reconciliation)
+
+	// Chat real-time fan-out (CHAT-006). Messages are persisted via REST in zyra-api;
+	// the WS server is a pure per-conversation relay. Outbound events are delivered
+	// only to clients subscribed to the same conversation_id (never echoed to sender).
+	MsgChatMessageNew    = "chat:message:new"    // relay: a new persisted message in a conversation
+	MsgChatMessageEdit   = "chat:message:edit"   // relay: a message in a conversation was edited
+	MsgChatMessageDelete = "chat:message:delete" // relay: a message in a conversation was deleted
+
+	// Reactions (CHAT-025) & typing indicators (CHAT-053, WS part). Both are pure
+	// relays consistent with chat:message — persistence (if any) happens via REST in
+	// zyra-api before the client emits the inbound event; the WS server never inspects
+	// the payload, only routes it by conversation_id to the OTHER subscribers.
+	MsgChatReactionUpdate = "chat:reaction:update" // relay: a message's reactions changed
+	MsgChatTyping         = "chat:typing"          // relay: a user started/stopped typing in a conversation
 )
 
 // Envelope is the top-level wrapper for all messages in both directions.
@@ -253,6 +267,22 @@ const (
 	ClientMsgHeartbeat    = "heartbeat"
 	ClientMsgSectionSync  = "section_sync" // client→server→broadcast: notify peers of section state change
 	ClientMsgVisibility   = "visibility"   // client→server: tab hidden/visible (drives server-authoritative follow)
+
+	// Chat real-time fan-out (CHAT-006). The client subscribes to specific
+	// conversation_ids and only receives relayed events for those conversations.
+	ClientMsgChatJoin          = "chat:join"           // client→server: subscribe to a conversation's relay
+	ClientMsgChatLeave         = "chat:leave"          // client→server: unsubscribe from a conversation's relay
+	ClientMsgChatMessage       = "chat:message"        // client→server: relay a persisted message to other subscribers
+	ClientMsgChatMessageEdit   = "chat:message:edit"   // client→server: relay a message edit to other subscribers
+	ClientMsgChatMessageDelete = "chat:message:delete" // client→server: relay a message deletion to other subscribers
+
+	// Reactions (CHAT-025) & typing indicators (CHAT-053, WS part). Relay-only,
+	// mirroring chat:message: the client emits these after its own REST call (for
+	// reactions) or on local input events (for typing). The server inspects only
+	// conversation_id and forwards the rest verbatim to the OTHER subscribers.
+	ClientMsgChatReaction    = "chat:reaction"      // client→server: relay a message's already-persisted reactions
+	ClientMsgChatTypingStart = "chat:typing:start"  // client→server: relay that the user started typing
+	ClientMsgChatTypingStop  = "chat:typing:stop"   // client→server: relay that the user stopped typing
 )
 
 // ClientVisibilityPayload reports the tab's Page-Visibility state.
@@ -397,6 +427,107 @@ type SectionSyncPayload struct {
 	IsLocked    bool     `json:"is_locked"`
 	MemberIDs   []string `json:"member_ids"`
 	Ended       bool     `json:"ended,omitempty"`
+}
+
+// ── Chat real-time fan-out (CHAT-006) ─────────────────────────────────────────
+//
+// The WS server is a pure relay: messages are persisted via REST in zyra-api and
+// arrive here already-formed. Inbound payloads carry an opaque message object the
+// server never inspects — it only routes by conversation_id and re-emits verbatim.
+
+// ClientChatJoinPayload subscribes the client to a conversation's relay.
+type ClientChatJoinPayload struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+// ClientChatLeavePayload unsubscribes the client from a conversation's relay.
+type ClientChatLeavePayload struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+// ClientChatMessagePayload relays a persisted message to the other subscribers of
+// a conversation. Message is the opaque, already-persisted message object; the
+// server forwards it verbatim and never inspects its shape.
+type ClientChatMessagePayload struct {
+	ConversationID string          `json:"conversation_id"`
+	Message        json.RawMessage `json:"message"`
+}
+
+// ChatMessagePayload is the OUTBOUND relay (chat:message:new) carrying the opaque
+// message object to a conversation's other subscribers.
+type ChatMessagePayload struct {
+	ConversationID string          `json:"conversation_id"`
+	Message        json.RawMessage `json:"message"`
+}
+
+// ClientChatMessageEditPayload relays a message edit to a conversation's other
+// subscribers. Beyond conversation_id the body is opaque (mirrored verbatim).
+type ClientChatMessageEditPayload struct {
+	ConversationID string          `json:"conversation_id"`
+	Message        json.RawMessage `json:"message,omitempty"`
+}
+
+// ChatMessageEditPayload is the OUTBOUND relay (chat:message:edit).
+type ChatMessageEditPayload struct {
+	ConversationID string          `json:"conversation_id"`
+	Message        json.RawMessage `json:"message,omitempty"`
+}
+
+// ClientChatMessageDeletePayload relays a message deletion to a conversation's
+// other subscribers.
+type ClientChatMessageDeletePayload struct {
+	ConversationID string `json:"conversation_id"`
+	MessageID      string `json:"message_id"`
+}
+
+// ChatMessageDeletePayload is the OUTBOUND relay (chat:message:delete).
+type ChatMessageDeletePayload struct {
+	ConversationID string `json:"conversation_id"`
+	MessageID      string `json:"message_id"`
+}
+
+// ── Reactions (CHAT-025) ──────────────────────────────────────────────────────
+//
+// The client persists a reaction via REST in zyra-api, then emits chat:reaction
+// carrying the already-persisted ReactionGroup[] (opaque to this server). The WS
+// server relays it verbatim to the conversation's OTHER subscribers as
+// chat:reaction:update so their message renders the new reaction state.
+
+// ClientChatReactionPayload relays a message's already-persisted reactions to a
+// conversation's other subscribers. Reactions is the opaque ReactionGroup[] the
+// client just persisted; the server forwards it verbatim and never inspects it.
+type ClientChatReactionPayload struct {
+	ConversationID string          `json:"conversation_id"`
+	MessageID      string          `json:"message_id"`
+	Reactions      json.RawMessage `json:"reactions"`
+}
+
+// ChatReactionUpdatePayload is the OUTBOUND relay (chat:reaction:update).
+type ChatReactionUpdatePayload struct {
+	ConversationID string          `json:"conversation_id"`
+	MessageID      string          `json:"message_id"`
+	Reactions      json.RawMessage `json:"reactions"`
+}
+
+// ── Typing indicators (CHAT-053, WS part) ─────────────────────────────────────
+//
+// No Redis TTL or aggregation here — the WS server is a pure relay. Clients manage
+// the typing display and the 3s auto-stop timeout. chat:typing:start / chat:typing:stop
+// both relay to a conversation's OTHER subscribers as chat:typing with a typing flag.
+
+// ClientChatTypingPayload relays a typing start/stop event. User is the opaque
+// {id,name} object the server forwards verbatim (never inspected).
+type ClientChatTypingPayload struct {
+	ConversationID string          `json:"conversation_id"`
+	User           json.RawMessage `json:"user"`
+}
+
+// ChatTypingPayload is the OUTBOUND relay (chat:typing). Typing is true for start,
+// false for stop; it has no omitempty so stop always carries an explicit false.
+type ChatTypingPayload struct {
+	ConversationID string          `json:"conversation_id"`
+	User           json.RawMessage `json:"user"`
+	Typing         bool            `json:"typing"`
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

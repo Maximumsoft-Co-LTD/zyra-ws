@@ -34,32 +34,15 @@ func New(redisStore *store.RedisStore, defaultCapacity int) *Hub {
 func (h *Hub) Join(
 	conn *websocket.Conn,
 	userID, displayName, characterName, avatarURL, workspaceID string,
-	capacity int, // from API; 0 = use default
+	capacity int, //nolint:unparam // kept for protocol compat; seat limit enforced in zyra-api
 	tileX, tileY int, // initial spawn tile passed by the client on connect
 ) {
-	cap := capacity
-	if cap <= 0 {
-		cap = h.defaultCapacity
-	}
-
+	_ = capacity
+	// Capacity is a seat limit on the workspace member list, enforced in zyra-api
+	// when a user becomes a member (invite/link/join-request). Anyone who reaches
+	// this point is already a confirmed member, so the live presence count can
+	// never exceed the seat limit — existing members always enter, even at full.
 	room := h.getOrCreateRoom(workspaceID)
-
-	// Capacity check: count in-memory clients + active Redis presence keys.
-	online := room.count()
-	if h.store != nil {
-		if redisCount, err := h.store.OnlineCount(context.Background(), workspaceID); err == nil && redisCount > online {
-			online = redisCount
-		}
-	}
-
-	if online >= cap {
-		slog.Warn("ws capacity reached", "workspace_id", workspaceID, "online", online, "capacity", cap)
-		if msg, err := encode(MsgCapacityReached, CapacityReachedPayload{Message: "office is full"}); err == nil {
-			conn.WriteMessage(1, msg) //nolint:errcheck // 1 = TextMessage
-		}
-		conn.Close()
-		return
-	}
 
 	c := &Client{
 		hub:           h,

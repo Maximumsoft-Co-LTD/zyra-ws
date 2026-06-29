@@ -77,6 +77,12 @@ type Client struct {
 	// Snapshots are throttled to at most 1 per second — new joiners only need
 	// periodic accuracy, not a write on every 20 Hz move.
 	lastSnapAt time.Time
+
+	// chatConvs is the reverse index of the conversations this client subscribed
+	// to (chat:join). It lets unregister remove the client from every conversation
+	// in Room.chatSubs without scanning the whole registry, preventing phantom
+	// relays after disconnect. Accessed only under Room.chatMu (CHAT-006).
+	chatConvs map[string]struct{}
 }
 
 // Player converts the client's current state into a Player DTO.

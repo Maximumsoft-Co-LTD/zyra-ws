@@ -56,6 +56,14 @@ type Room struct {
 	obstacleMu       sync.Mutex
 	obstacleLoadedAt time.Time
 	obstacleGrid     *store.ObstacleGrid
+
+	// Chat real-time fan-out registry (CHAT-006). Maps conversation_id → set of
+	// subscribed clients (userID → *Client) so a chat event relays only to the
+	// members of that conversation, not the whole workspace. Guarded by chatMu;
+	// the reverse set lives on each Client (Client.chatConvs) for O(1) disconnect
+	// cleanup. Messages are persisted via REST in zyra-api — this is relay only.
+	chatMu   sync.Mutex
+	chatSubs map[string]map[string]*Client // conversation_id → userID → client
 }
 
 // obstacleTTL bounds how stale the cached obstacle grid may be.
@@ -213,6 +221,10 @@ func (r *Room) unregister(c *Client) {
 	// Remove from AOI grid so departing player stops receiving broadcasts.
 	r.aoi.Remove(c.UserID)
 
+	// Drop the client from every chat conversation it subscribed to so no relay
+	// targets a disconnected connection (CHAT-006).
+	r.removeChatSubscriber(c)
+
 	// Remove Redis presence, position snapshot, and save last tile (LP-3).
 	// If the player was mid-walk (IsMoving), save the pre-move start tile
 	// instead of the destination tile — the player never actually reached it.
@@ -286,6 +298,22 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 		r.handleSectionSync(c, env.Payload)
 	case ClientMsgVisibility:
 		r.handleVisibility(c, env.Payload)
+	case ClientMsgChatJoin:
+		r.handleChatJoin(c, env.Payload)
+	case ClientMsgChatLeave:
+		r.handleChatLeave(c, env.Payload)
+	case ClientMsgChatMessage:
+		r.handleChatMessage(c, env.Payload)
+	case ClientMsgChatMessageEdit:
+		r.handleChatMessageEdit(c, env.Payload)
+	case ClientMsgChatMessageDelete:
+		r.handleChatMessageDelete(c, env.Payload)
+	case ClientMsgChatReaction:
+		r.handleChatReaction(c, env.Payload)
+	case ClientMsgChatTypingStart:
+		r.handleChatTyping(c, env.Payload, true)
+	case ClientMsgChatTypingStop:
+		r.handleChatTyping(c, env.Payload, false)
 	default:
 		r.sendError(c, "unknown message type: "+env.Type)
 	}
