@@ -104,10 +104,17 @@ func (r *Room) register(c *Client) {
 	r.aoi.Move(c, c.TileX, c.TileY)
 
 	if oldClient != nil {
-		// Force-close the old connection so its goroutines exit without holding resources.
-		// Because Store already replaced oldClient in the map, its ReadPump's unregister
-		// call will fail CompareAndDelete and return early — no phantom "left" event.
-		_ = oldClient.conn.Close()
+		// Notify the old tab/device that it was superseded, then close after a
+		// short delay so the WritePump has time to flush the message.
+		if msg, err := encode(MsgSessionReplaced, SessionReplacedPayload{
+			Reason: "Another session connected to this workspace",
+		}); err == nil {
+			oldClient.Send(msg)
+		}
+		go func(oc *Client) {
+			time.Sleep(200 * time.Millisecond)
+			_ = oc.conn.Close()
+		}(oldClient)
 	}
 
 	slog.Info("ws room join", "workspace_id", r.workspaceID, "user_id", c.UserID, "online", r.count())

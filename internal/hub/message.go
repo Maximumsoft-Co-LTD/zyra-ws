@@ -34,8 +34,9 @@ const (
 	MsgKnockDenied     = "knock_denied"     // unicast: knock was denied
 	MsgKnockDecided    = "knock_decided"    // broadcast to room: a decision was made (dismiss notification on all occupants)
 	MsgKnockCancelled  = "knock_cancelled"  // broadcast to room: requester cancelled their knock (dismiss notification on all occupants)
-	MsgCapacityReached = "capacity_reached" // unicast: office is full — connection will be closed
-	MsgSectionSync     = "section_sync"     // broadcast: section state changed (relay from any client)
+	MsgCapacityReached  = "capacity_reached"  // unicast: office is full — connection will be closed
+	MsgSessionReplaced  = "session_replaced"  // unicast: another tab/device connected — this connection will close
+	MsgSectionSync      = "section_sync"      // broadcast: section state changed (relay from any client)
 	MsgWaveAnimation   = "wave_animation"   // broadcast: show wave animation on sender's avatar
 	MsgServerDrain     = "server_drain"     // broadcast: server is shutting down — client should reconnect
 	MsgForceSync       = "force_sync"       // unicast: server corrects the client's position (reconciliation)
@@ -209,6 +210,12 @@ type FollowChangedPayload struct {
 
 type CapacityReachedPayload struct {
 	Message string `json:"message"`
+}
+
+// SessionReplacedPayload is sent to the old connection when the same user opens
+// a new connection to the same workspace from another tab or device.
+type SessionReplacedPayload struct {
+	Reason string `json:"reason"`
 }
 
 // ServerDrainPayload is broadcast to all clients when the server is about to shut down.
