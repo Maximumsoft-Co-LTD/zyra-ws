@@ -20,6 +20,14 @@ type knockEntry struct {
 	zoneID      string
 }
 
+// denyTracker tracks consecutive knock denials per zone+user (in-memory fallback when Redis is unavailable).
+type denyTracker struct {
+	count   int64
+	expires time.Time
+}
+
+const denyTrackerTTL = 10 * time.Minute
+
 // pendingMoveEntry holds the latest buffered move for one player between tick flushes.
 // roomID is captured at buffer time so flushMoves can route without touching the Client.
 type pendingMoveEntry struct {
@@ -34,6 +42,7 @@ type Room struct {
 	hub           *Hub
 	waveCooldowns sync.Map // "senderID:targetID" → time.Time (expiry) — fallback when Redis unavailable
 	knockPending  sync.Map // requestID → knockEntry
+	knockDenies   sync.Map // "zoneID:userID" → *denyTracker — in-memory deny count fallback
 	aoi           *AOIGrid // open-floor spatial index for move broadcast filtering
 	pendingMoves  sync.Map // userID → pendingMoveEntry — latest position per player, flushed every 50ms
 	stopTick      chan struct{}
@@ -72,6 +81,26 @@ const obstacleTTL = 30 * time.Second
 // redisStore returns the store from the hub (may be nil).
 func (r *Room) redisStore() *store.RedisStore {
 	return r.hub.store
+}
+
+// incrementDenyCount increments the in-memory deny counter for zone+user and returns the new total.
+func (r *Room) incrementDenyCount(zoneID, userID string) int64 {
+	key := zoneID + ":" + userID
+	now := time.Now()
+	v, loaded := r.knockDenies.Load(key)
+	if loaded {
+		t := v.(*denyTracker)
+		if now.After(t.expires) {
+			t.count = 1
+		} else {
+			t.count++
+		}
+		t.expires = now.Add(denyTrackerTTL)
+		return t.count
+	}
+	t := &denyTracker{count: 1, expires: now.Add(denyTrackerTTL)}
+	r.knockDenies.Store(key, t)
+	return 1
 }
 
 // register adds a client to the room and broadcasts a joined event to others.
@@ -1430,12 +1459,15 @@ func (r *Room) handleKnockDecide(c *Client, payload json.RawMessage) {
 	} else {
 		// Deny — increment counter and set cooldown.
 		cooldownSec := 30
+		var denyCount int64
 		if s := r.redisStore(); s != nil {
-			denyCount, _ := s.IncrementDenyCount(ctx, r.workspaceID, entry.zoneID, entry.requesterID)
+			denyCount, _ = s.IncrementDenyCount(ctx, r.workspaceID, entry.zoneID, entry.requesterID)
 			_ = s.SetKnockCooldown(ctx, r.workspaceID, entry.zoneID, entry.requesterID, denyCount)
-			if denyCount >= 3 {
-				cooldownSec = 300 // 5 minutes
-			}
+		} else {
+			denyCount = r.incrementDenyCount(entry.zoneID, entry.requesterID)
+		}
+		if denyCount >= 3 {
+			cooldownSec = 300 // 5 minutes
 		}
 		if msg, err := encode(MsgKnockDenied, KnockDeniedPayload{
 			RequestID:    p.RequestID,

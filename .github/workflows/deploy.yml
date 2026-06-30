@@ -58,12 +58,20 @@ jobs:
         env:
           TOKEN_KEY: ${{ secrets.TOKEN_KEY }}
           ALLOWED_ORIGINS: ${{ secrets.ALLOWED_ORIGINS }}
+          REDIS_HOST: ${{ secrets.REDIS_HOST }}
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
         run: |
           python3 - <<'PY' > env.yaml
           import os, yaml
+          host = os.environ.get("REDIS_HOST", "")
+          pw = os.environ.get("REDIS_PASSWORD", "")
+          redis_url = ""
+          if host:
+              redis_url = f"redis://:{pw}@{host}:6379" if pw else f"redis://{host}:6379"
           out = {
               "tokenKey": os.environ.get("TOKEN_KEY", ""),
               "ALLOWED_ORIGINS": os.environ.get("ALLOWED_ORIGINS", ""),
+              "REDIS_URL": redis_url,
           }
           print(yaml.safe_dump(out, default_style='"'))
           PY
