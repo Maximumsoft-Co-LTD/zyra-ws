@@ -3,8 +3,10 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -33,7 +35,7 @@ func New(redisStore *store.RedisStore, defaultCapacity int) *Hub {
 // Control returns immediately; the goroutines own the connection from here on.
 func (h *Hub) Join(
 	conn *websocket.Conn,
-	userID, displayName, characterName, avatarURL, workspaceID string,
+	userID, displayName, characterName, avatarURL, workspaceID, clientSessionID string,
 	capacity int, //nolint:unparam // kept for protocol compat; seat limit enforced in zyra-api
 	tileX, tileY int, // initial spawn tile passed by the client on connect
 ) {
@@ -45,17 +47,18 @@ func (h *Hub) Join(
 	room := h.getOrCreateRoom(workspaceID)
 
 	c := &Client{
-		hub:           h,
-		room:          room,
-		conn:          conn,
-		send:          make(chan []byte, 256),
-		sendBin:       make(chan []byte, 256),
-		UserID:        userID,
-		DisplayName:   displayName,
-		CharacterName: characterName,
-		AvatarURL:     avatarURL,
-		TileX:         tileX,
-		TileY:         tileY,
+		hub:             h,
+		room:            room,
+		conn:            conn,
+		send:            make(chan []byte, 256),
+		sendBin:         make(chan []byte, 256),
+		UserID:          userID,
+		DisplayName:     displayName,
+		CharacterName:   characterName,
+		AvatarURL:       avatarURL,
+		ClientSessionID: clientSessionID,
+		TileX:           tileX,
+		TileY:           tileY,
 	}
 
 	// Restore last known tile from Redis (written by unregister on disconnect).
@@ -83,6 +86,31 @@ func (h *Hub) Join(
 	go c.ReadPump()
 }
 
+// PushNotification delivers a freshly-created in-app notification (raw model.Notification
+// JSON) to the target user's live connection in the given workspace room, as a
+// chat:notification:new unicast (SC-CHAT-10). It is fed by the Redis vo:notify
+// subscriber: zyra-api creates the row, then publishes it here. A no-op when the user
+// isn't connected to that room — they pick the notification up via REST on next load.
+func (h *Hub) PushNotification(workspaceID, userID string, notification json.RawMessage) {
+	if workspaceID == "" || userID == "" {
+		return
+	}
+	v, ok := h.rooms.Load(workspaceID)
+	if !ok {
+		return
+	}
+	room := v.(*Room)
+	target, ok := room.getClient(userID)
+	if !ok {
+		return
+	}
+	msg, err := encode(MsgChatNotificationNew, ChatNotificationNewPayload{Notification: notification})
+	if err != nil {
+		return
+	}
+	target.Send(msg)
+}
+
 // Stats returns workspaceID → online count (used by /healthz).
 func (h *Hub) Stats() map[string]int {
 	stats := make(map[string]int)
@@ -98,14 +126,21 @@ func (h *Hub) getOrCreateRoom(workspaceID string) *Room {
 		return v.(*Room)
 	}
 	room := &Room{
-		workspaceID: workspaceID,
-		hub:         h,
-		aoi:         NewAOIGrid(),
-		stopTick:    make(chan struct{}),
+		workspaceID:   workspaceID,
+		hub:           h,
+		aoi:           NewAOIGrid(),
+		stopTick:          make(chan struct{}),
+		chatSessions:      make(map[string]*ChatSession),
+		playerSession:     make(map[string]string),
+		chatMemberLeaveAt: make(map[string]time.Time),
+		chatRecentlyLeft:  make(map[string]chatRecentLeave),
+		chatSuppress:      make(map[string]map[string]struct{}),
 	}
 	actual, loaded := h.rooms.LoadOrStore(workspaceID, room)
 	if !loaded {
 		go room.runMoveTicker()
+		go room.runSessionTicker()
+		go room.runSnapshotTicker()
 	}
 	return actual.(*Room)
 }

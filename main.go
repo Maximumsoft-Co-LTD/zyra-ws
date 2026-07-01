@@ -46,6 +46,19 @@ func main() {
 	h := hub.New(redisStore, cfg.DefaultCapacity)
 	hnd := handler.New(h, cfg.TokenKey, cfg.AllowedOrigins)
 
+	// Fan zyra-api's in-app notifications (Redis vo:notify) out to live connections
+	// as chat:notification:new (SC-CHAT-10). No-op when Redis is absent.
+	if redisStore != nil {
+		notifCh, closeNotifSub := redisStore.SubscribeNotifications(context.Background())
+		defer closeNotifSub() //nolint:errcheck
+		go func() {
+			for p := range notifCh {
+				h.PushNotification(p.WorkspaceID, p.UserID, p.Notification)
+			}
+		}()
+		slog.Info("notification push subscriber started", "channel", "vo:notify")
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", hnd.Healthz)
 	mux.HandleFunc("GET /ws", hnd.Connect)

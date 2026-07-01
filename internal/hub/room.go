@@ -28,6 +28,18 @@ type denyTracker struct {
 
 const denyTrackerTTL = 10 * time.Minute
 
+// circleDenyEntry tracks how many times a requester has been denied for a specific circle.
+type circleDenyEntry struct {
+	mu      sync.Mutex
+	count   int
+	lockedUntil time.Time
+}
+
+const (
+	circleDenyThreshold = 3             // deny cooldown kicks in after this many denials
+	circleDenyCooldown  = 5 * time.Minute
+)
+
 // pendingMoveEntry holds the latest buffered move for one player between tick flushes.
 // roomID is captured at buffer time so flushMoves can route without touching the Client.
 type pendingMoveEntry struct {
@@ -40,9 +52,11 @@ type Room struct {
 	workspaceID   string
 	clients       sync.Map // userID → *Client
 	hub           *Hub
-	waveCooldowns sync.Map // "senderID:targetID" → time.Time (expiry) — fallback when Redis unavailable
-	knockPending  sync.Map // requestID → knockEntry
-	knockDenies   sync.Map // "zoneID:userID" → *denyTracker — in-memory deny count fallback
+	waveCooldowns    sync.Map // "senderID:targetID" → time.Time (expiry) — fallback when Redis unavailable
+	knockPending     sync.Map // requestID → knockEntry
+	knockDenies      sync.Map // "zoneID:userID" → *denyTracker — in-memory deny count fallback
+	circleAskPending sync.Map // requesterID → circleID — one pending request at a time
+	circleDenies     sync.Map // "circleID:requesterID" → *circleDenyEntry — deny count + cooldown
 	aoi           *AOIGrid // open-floor spatial index for move broadcast filtering
 	pendingMoves  sync.Map // userID → pendingMoveEntry — latest position per player, flushed every 50ms
 	stopTick      chan struct{}
@@ -73,6 +87,18 @@ type Room struct {
 	// cleanup. Messages are persisted via REST in zyra-api — this is relay only.
 	chatMu   sync.Mutex
 	chatSubs map[string]map[string]*Client // conversation_id → userID → client
+
+	// Chat-space (proximity chat) sessions — server-authoritative membership.
+	// recomputeChatSessions (runSessionTicker) is the only writer besides the
+	// accept/disconnect mutators; all guarded by chatSessionMu. chatStateHash is
+	// the fingerprint of the last broadcast state, for change detection.
+	chatSessionMu     sync.Mutex
+	chatSessions      map[string]*ChatSession    // sessionID → session
+	playerSession     map[string]string          // userID → sessionID (membership index)
+	chatMemberLeaveAt map[string]time.Time            // userID → first-disconnected time (grace timer)
+	chatRecentlyLeft  map[string]chatRecentLeave      // userID → rejoin window (5s)
+	chatSuppress      map[string]map[string]struct{}  // userID → peers to skip auto-reform (after Leave)
+	chatStateHash     string
 }
 
 // obstacleTTL bounds how stale the cached obstacle grid may be.
@@ -133,12 +159,22 @@ func (r *Room) register(c *Client) {
 	r.aoi.Move(c, c.TileX, c.TileY)
 
 	if oldClient != nil {
-		// Notify the old tab/device that it was superseded, then close after a
-		// short delay so the WritePump has time to flush the message.
-		if msg, err := encode(MsgSessionReplaced, SessionReplacedPayload{
-			Reason: "Another session connected to this workspace",
-		}); err == nil {
-			oldClient.Send(msg)
+		// Distinguish a genuine second tab/device from the same tab merely
+		// reconnecting (liveness watchdog / wake trigger). The client sends a
+		// stable per-tab id; when it matches the old connection's, this is the
+		// SAME tab taking over its own stale socket — swap silently. Only a
+		// different (or absent) id means another session, which warrants the
+		// "Session Active Elsewhere" notice. Without this, every idle reconnect
+		// would superfluously evict-and-notify itself and pop a phantom modal.
+		sameTab := c.ClientSessionID != "" && oldClient.ClientSessionID == c.ClientSessionID
+		if !sameTab {
+			// Notify the old tab/device that it was superseded, then close after a
+			// short delay so the WritePump has time to flush the message.
+			if msg, err := encode(MsgSessionReplaced, SessionReplacedPayload{
+				Reason: "Another session connected to this workspace",
+			}); err == nil {
+				oldClient.Send(msg)
+			}
 		}
 		go func(oc *Client) {
 			time.Sleep(200 * time.Millisecond)
@@ -226,6 +262,11 @@ func (r *Room) register(c *Client) {
 	if msg, err := encode(MsgJoined, JoinedPayload{Player: c.Player()}); err == nil {
 		r.broadcastExcept(msg, c.UserID)
 	}
+
+	// Send the current chat-space sessions to the joiner. The session ticker only
+	// broadcasts on CHANGE, so a client that connects while sessions already exist
+	// would otherwise never learn about them (no pop, no Ask-to-Join). (Phase A)
+	r.sendChatStateTo(c)
 }
 
 // unregister removes a client and broadcasts a left event.
@@ -257,6 +298,10 @@ func (r *Room) unregister(c *Client) {
 	// Remove from AOI grid so departing player stops receiving broadcasts.
 	r.aoi.Remove(c.UserID)
 
+	// Drop the player from any chat-space session immediately so remaining
+	// members don't keep them in the circle until the next session tick.
+	r.removeFromChatSession(c.UserID)
+
 	// Drop the client from every chat conversation it subscribed to so no relay
 	// targets a disconnected connection (CHAT-006).
 	r.removeChatSubscriber(c)
@@ -280,6 +325,9 @@ func (r *Room) unregister(c *Client) {
 		_ = s.ExpireFollow(ctx, r.workspaceID, c.UserID)
 		_ = s.DeletePosSnapshot(ctx, r.workspaceID, c.UserID)
 	}
+
+	// Clean up circle ask state so disconnecting doesn't permanently block a re-join slot.
+	r.circleAskPending.Delete(c.UserID)
 
 	if msg, err := encode(MsgLeft, LeftPayload{UserID: c.UserID}); err == nil {
 		r.broadcastExcept(msg, c.UserID)
@@ -332,6 +380,14 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 		r.handleHeartbeat(c)
 	case ClientMsgSectionSync:
 		r.handleSectionSync(c, env.Payload)
+	case ClientMsgCircleAskJoin:
+		r.handleCircleAskJoin(c, env.Payload)
+	case ClientMsgCircleJoinDecide:
+		r.handleCircleJoinDecide(c, env.Payload)
+	case ClientMsgCircleLeave:
+		r.handleCircleLeave(c, env.Payload)
+	case ClientMsgCircleRejoin:
+		r.handleCircleRejoin(c, env.Payload)
 	case ClientMsgVisibility:
 		r.handleVisibility(c, env.Payload)
 	case ClientMsgChatJoin:
@@ -350,6 +406,8 @@ func (r *Room) handleClientMessage(c *Client, raw []byte) {
 		r.handleChatTyping(c, env.Payload, true)
 	case ClientMsgChatTypingStop:
 		r.handleChatTyping(c, env.Payload, false)
+	case ClientMsgChatConversationNotify:
+		r.handleChatConversationNew(c, env.Payload)
 	default:
 		r.sendError(c, "unknown message type: "+env.Type)
 	}
@@ -441,8 +499,45 @@ func (r *Room) handleMove(c *Client, payload json.RawMessage) {
 	// Update the spatial grid and buffer this move for the next tick flush.
 	// Encoding and fan-out happen in flushMoves every 20ms — this keeps the
 	// hot path (ReadPump goroutine) free of encode + per-peer Send overhead.
-	r.aoi.Move(c, c.TileX, c.TileY)
+	if r.aoi.Move(c, c.TileX, c.TileY) {
+		// Crossed into a new AOI cell — send this client the current positions of
+		// stationary neighbours it can now see, so a player who stood still while we
+		// were out of range no longer appears frozen at a stale tile until they move.
+		r.sendNeighborSnapshot(c)
+	}
 	r.pendingMoves.Store(c.UserID, pendingMoveEntry{moved: moved, roomID: c.RoomID})
+}
+
+// sendNeighborSnapshot unicasts the current position of every stationary peer in
+// c's AOI neighbourhood to c. Mid-walk peers are skipped — their movement is
+// already covered by the room-wide "moving"/"stopped" broadcast, and a static
+// snapshot would wrongly snap them to their eager destination tile. This closes
+// the AOI gap where an observer never learns a still player's position because no
+// "moved" event fires while the two are in range.
+func (r *Room) sendNeighborSnapshot(c *Client) {
+	for _, peer := range r.aoi.Subscribers(c.TileX, c.TileY, c.UserID) {
+		if peer.IsMoving {
+			continue
+		}
+		// Only reconcile peers in the same room context (both open-floor, or the same
+		// private room) — AOI cells are shared across rooms but visibility is not.
+		if peer.RoomID != c.RoomID {
+			continue
+		}
+		moved := MovedPayload{
+			UserID:    peer.UserID,
+			TileX:     peer.TileX,
+			TileY:     peer.TileY,
+			PX:        peer.PX,
+			PY:        peer.PY,
+			AvatarURL: peer.AvatarURL,
+			Direction: peer.Direction,
+			Sitting:   peer.Sitting,
+		}
+		if msg, err := encode(MsgMoved, moved); err == nil {
+			c.Send(msg)
+		}
+	}
 }
 
 // currentPathTile returns the tile a player is at right now along an active path,
@@ -604,7 +699,13 @@ func (r *Room) handleMoveTo(c *Client, payload json.RawMessage) {
 		}
 	}
 
-	r.aoi.Move(c, c.TileX, c.TileY)
+	// AOI cell is keyed to the destination tile (set above). On a cell change, send
+	// this mover the current positions of stationary neighbours near the destination
+	// so they're correct the moment it arrives (closes the "still player looks frozen
+	// until they move" gap when walking toward someone).
+	if r.aoi.Move(c, c.TileX, c.TileY) {
+		r.sendNeighborSnapshot(c)
+	}
 
 	// Drive any backgrounded followers behind this mover one tile behind, mirroring
 	// this path — keeps the chain moving when a middle node is hidden.
@@ -737,6 +838,39 @@ func (r *Room) runMoveTicker() {
 		select {
 		case <-t.C:
 			r.flushMoves()
+		case <-r.stopTick:
+			return
+		}
+	}
+}
+
+// positionHeartbeatInterval bounds how long a missed position update can leave a
+// peer rendered at a stale tile. The continuous `move` stream is AOI-filtered and
+// only fires while moving, so a still player can otherwise look frozen on a client
+// that never received their last position. This heartbeat re-sends every client the
+// authoritative position of its STATIONARY neighbours, so any drift self-heals
+// within one interval — the safety net that makes sync production-solid.
+const positionHeartbeatInterval = 3 * time.Second
+
+// runSnapshotTicker periodically reconciles every client with its neighbours'
+// authoritative positions. Idempotent: a peer already at the right tile re-applies
+// the same position (no visible change). Runs as a dedicated goroutine per Room.
+func (r *Room) runSnapshotTicker() {
+	t := time.NewTicker(positionHeartbeatInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			r.clients.Range(func(_, v any) bool {
+				c := v.(*Client)
+				// A hidden tab's rAF is paused; it reconciles on resume via force_sync
+				// + the resync snapshot, so skip it here to save bandwidth.
+				if c.Hidden {
+					return true
+				}
+				r.sendNeighborSnapshot(c)
+				return true
+			})
 		case <-r.stopTick:
 			return
 		}
@@ -1204,7 +1338,12 @@ func (r *Room) handleVisibility(c *Client, payload json.RawMessage) {
 		"followTarget", c.FollowTargetID,
 		"follower", c.FollowerID,
 	)
-	if changed && !p.Hidden && c.FollowTargetID != "" {
+	// On return to foreground, always re-align the client to its authoritative
+	// position — not only when following. A backgrounded tab pauses rAF and can
+	// drift (server-driven follow, eager move_to destinations, half-open socket),
+	// so without this the returning client and its peers can disagree on where it
+	// stands, which in turn flickers proximity chat sessions.
+	if changed && !p.Hidden {
 		r.forceSync(c, "visibility_resume")
 	}
 }
@@ -1785,6 +1924,141 @@ func (r *Room) handleSectionSync(c *Client, payload json.RawMessage) {
 		return
 	}
 	msg, err := encode(MsgSectionSync, p)
+	if err != nil {
+		return
+	}
+	r.broadcast(msg)
+}
+
+// handleCircleAskJoin relays a circle join request with two guards:
+//  1. Only one pending request per requester at a time — drops duplicates.
+//  2. Deny-cooldown: requester is locked out for circleDenyCooldown after
+//     circleDenyThreshold consecutive denials for the same circle.
+func (r *Room) handleCircleAskJoin(c *Client, payload json.RawMessage) {
+	var p CircleAskJoinPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid circle_ask_join payload")
+		return
+	}
+
+	// Guard 1: block if the requester already has a pending request for this circle.
+	if existing, loaded := r.circleAskPending.Load(c.UserID); loaded && existing.(string) == p.CircleID {
+		r.sendError(c, "already waiting for a response")
+		return
+	}
+
+	// Guard 2: block if deny-cooldown is active.
+	denyKey := p.CircleID + ":" + c.UserID
+	if raw, ok := r.circleDenies.Load(denyKey); ok {
+		entry := raw.(*circleDenyEntry)
+		entry.mu.Lock()
+		locked := entry.count >= circleDenyThreshold && time.Now().Before(entry.lockedUntil)
+		entry.mu.Unlock()
+		if locked {
+			r.sendError(c, "cooldown active — try again later")
+			return
+		}
+	}
+
+	requestID := generateRequestID()
+	r.circleAskPending.Store(c.UserID, p.CircleID)
+
+	out := CircleJoinRequestPayload{
+		RequestID:       requestID,
+		CircleID:        p.CircleID,
+		RequesterUserID: c.UserID,
+		RequesterName:   c.EffectiveName(),
+		RequesterAvatar: c.AvatarURL,
+	}
+	msg, err := encode(MsgCircleJoinRequest, out)
+	if err != nil {
+		r.circleAskPending.Delete(c.UserID)
+		return
+	}
+	r.broadcast(msg)
+}
+
+// handleCircleJoinDecide relays a circle join decision and maintains deny counters.
+func (r *Room) handleCircleJoinDecide(c *Client, payload json.RawMessage) {
+	var p CircleJoinDecidePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid circle_join_decide payload")
+		return
+	}
+
+	// Clear the requester's pending slot so they can ask again (or be blocked by cooldown).
+	r.circleAskPending.Delete(p.RequesterUserID)
+
+	if !p.Allow {
+		// Track consecutive denials for this circle+requester pair.
+		denyKey := p.CircleID + ":" + p.RequesterUserID
+		raw, _ := r.circleDenies.LoadOrStore(denyKey, &circleDenyEntry{})
+		entry := raw.(*circleDenyEntry)
+		entry.mu.Lock()
+		entry.count++
+		if entry.count >= circleDenyThreshold {
+			entry.lockedUntil = time.Now().Add(circleDenyCooldown)
+		}
+		entry.mu.Unlock()
+	} else {
+		// Accepted — reset deny counter.
+		r.circleDenies.Delete(p.CircleID + ":" + p.RequesterUserID)
+	}
+
+	var cooldownUntilMs int64
+	if !p.Allow {
+		if raw, ok := r.circleDenies.Load(p.CircleID + ":" + p.RequesterUserID); ok {
+			entry := raw.(*circleDenyEntry)
+			entry.mu.Lock()
+			if !entry.lockedUntil.IsZero() {
+				cooldownUntilMs = entry.lockedUntil.UnixMilli()
+			}
+			entry.mu.Unlock()
+		}
+	}
+
+	out := CircleJoinResultPayload{
+		RequestID:       p.RequestID,
+		CircleID:        p.CircleID,
+		Allowed:         p.Allow,
+		RequesterUserID: p.RequesterUserID,
+		CooldownUntilMs: cooldownUntilMs,
+	}
+	msg, err := encode(MsgCircleJoinResult, out)
+	if err != nil {
+		return
+	}
+	r.broadcast(msg)
+
+	// On accept, add the requester to the authoritative session so the new
+	// membership (and the expanded pop) is identical for every viewer. CircleID
+	// is the server session id. addToChatSession broadcasts the new state itself.
+	if p.Allow {
+		r.addToChatSession(p.CircleID, p.RequesterUserID)
+	}
+}
+
+// handleCircleLeave removes the player from their authoritative session on an
+// explicit Leave and suppresses auto-reforming with those peers until they walk
+// away. leaveChatSession broadcasts the new chat_space_state itself.
+func (r *Room) handleCircleLeave(c *Client, payload json.RawMessage) {
+	var p CircleLeavePayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid circle_leave payload")
+		return
+	}
+	r.leaveChatSession(c.UserID)
+}
+
+// handleCircleRejoin relays a member returning within the 5s grace window so the
+// remaining members re-add them without a fresh Ask-to-Join. (SC-CHAT-03)
+func (r *Room) handleCircleRejoin(c *Client, payload json.RawMessage) {
+	var p CircleRejoinPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid circle_rejoin payload")
+		return
+	}
+	msg, err := encode(MsgCircleRejoined, CircleRejoinedPayload{CircleID: p.CircleID, UserID: c.UserID})
 	if err != nil {
 		return
 	}

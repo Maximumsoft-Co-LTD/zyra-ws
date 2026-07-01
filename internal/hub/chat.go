@@ -90,6 +90,37 @@ func (r *Room) relayChat(conversationID, excludeUserID string, msg []byte) {
 	}
 }
 
+// handleChatConversationNew unicasts a chat:conversation:new to each named recipient
+// that is currently online in this room, so a brand-new conversation (one the recipient
+// has not subscribed to yet — e.g. a first-ever DM) surfaces in their sidebar live. The
+// sender is never notified; offline recipients are skipped and pick the conversation up
+// via REST on their next load.
+func (r *Room) handleChatConversationNew(c *Client, payload json.RawMessage) {
+	var p ClientChatConversationNotifyPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		r.sendError(c, "invalid chat:conversation:notify payload")
+		return
+	}
+	if p.ConversationID == "" {
+		r.sendError(c, "conversation_id required")
+		return
+	}
+	msg, err := encode(MsgChatConversationNew, ChatConversationNewPayload{
+		ConversationID: p.ConversationID,
+	})
+	if err != nil {
+		return
+	}
+	for _, uid := range p.RecipientUserIDs {
+		if uid == "" || uid == c.UserID {
+			continue
+		}
+		if target, ok := r.getClient(uid); ok {
+			target.Send(msg)
+		}
+	}
+}
+
 // handleChatJoin subscribes the client to a conversation's relay.
 func (r *Room) handleChatJoin(c *Client, payload json.RawMessage) {
 	var p ClientChatJoinPayload

@@ -69,7 +69,7 @@ func (h *Handler) Healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // Connect upgrades an HTTP request to a WebSocket connection and joins the hub.
-// GET /ws?workspace_id=<id>&token=<jwt>[&avatar_url=<url>][&character_name=<name>][&capacity=<n>][&tile_x=<n>&tile_y=<n>]
+// GET /ws?workspace_id=<id>&token=<jwt>[&avatar_url=<url>][&character_name=<name>][&capacity=<n>][&tile_x=<n>&tile_y=<n>][&client_session_id=<id>]
 func (h *Handler) Connect(w http.ResponseWriter, r *http.Request) {
 	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace_id"))
 	tokenStr := strings.TrimSpace(r.URL.Query().Get("token"))
@@ -78,6 +78,7 @@ func (h *Handler) Connect(w http.ResponseWriter, r *http.Request) {
 	capacityStr := strings.TrimSpace(r.URL.Query().Get("capacity"))
 	tileXStr := strings.TrimSpace(r.URL.Query().Get("tile_x"))
 	tileYStr := strings.TrimSpace(r.URL.Query().Get("tile_y"))
+	clientSessionID := strings.TrimSpace(r.URL.Query().Get("client_session_id"))
 
 	if workspaceID == "" {
 		http.Error(w, "workspace_id required", http.StatusBadRequest)
@@ -101,7 +102,7 @@ func (h *Handler) Connect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.hub.Join(conn, claims.UserID, claims.DisplayName, characterName, avatarURL, workspaceID, capacity, tileX, tileY)
+	h.hub.Join(conn, claims.UserID, claims.DisplayName, characterName, avatarURL, workspaceID, clientSessionID, capacity, tileX, tileY)
 }
 
 // itoa is a tiny int-to-string helper to avoid importing strconv here.

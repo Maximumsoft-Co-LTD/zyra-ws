@@ -34,14 +34,15 @@ func tileToCell(tx, ty int) cellKey {
 	return cellKey{tx / AOICellSize, ty / AOICellSize}
 }
 
-// Move updates the client's cell in the grid.
-// A no-op if the client has not crossed a cell boundary.
-func (g *AOIGrid) Move(c *Client, tx, ty int) {
+// Move updates the client's cell in the grid. Returns true if the client crossed
+// into a new cell (so the caller can send an "appear" snapshot of the now-visible
+// neighbourhood), false if it stayed put.
+func (g *AOIGrid) Move(c *Client, tx, ty int) bool {
 	newCell := tileToCell(tx, ty)
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if old, ok := g.pos[c.UserID]; ok && old == newCell {
-		return // still in the same cell — no index update needed
+		return false // still in the same cell — no index update needed
 	}
 	// remove from old cell
 	if old, ok := g.pos[c.UserID]; ok {
@@ -56,6 +57,7 @@ func (g *AOIGrid) Move(c *Client, tx, ty int) {
 	}
 	g.cells[newCell][c.UserID] = c
 	g.pos[c.UserID] = newCell
+	return true
 }
 
 // Remove clears the client from the grid on disconnect.

@@ -435,6 +435,79 @@ func TestHandleChatTyping_EmptyConversationID_Error(t *testing.T) {
 	}
 }
 
+// ── chat:conversation:notify → chat:conversation:new (per-user unicast) ────────
+
+// findConversationNew returns the conversation_id of the first chat:conversation:new.
+func findConversationNew(msgs []Envelope) (string, bool) {
+	for _, m := range msgs {
+		if m.Type != MsgChatConversationNew {
+			continue
+		}
+		var p ChatConversationNewPayload
+		if err := json.Unmarshal(m.Payload, &p); err == nil {
+			return p.ConversationID, true
+		}
+	}
+	return "", false
+}
+
+func TestHandleChatConversationNew_NotifiesOnlineRecipient(t *testing.T) {
+	r := newTestRoom()
+	sender := newTestClient(r, "alice", "available")
+	recipient := newTestClient(r, "bob", "available")
+
+	// bob has NOT subscribed to conv-new — this is the first-contact case.
+	r.handleChatConversationNew(sender, encodePayload(ClientChatConversationNotifyPayload{
+		ConversationID:   "conv-new",
+		RecipientUserIDs: []string{"bob"},
+	}))
+
+	convID, ok := findConversationNew(drain(recipient))
+	require.True(t, ok, "online recipient should receive chat:conversation:new without subscribing")
+	assert.Equal(t, "conv-new", convID)
+}
+
+func TestHandleChatConversationNew_DoesNotNotifySender(t *testing.T) {
+	r := newTestRoom()
+	sender := newTestClient(r, "alice", "available")
+
+	// Sender lists itself among recipients — it must still be skipped.
+	r.handleChatConversationNew(sender, encodePayload(ClientChatConversationNotifyPayload{
+		ConversationID:   "conv-new",
+		RecipientUserIDs: []string{"alice"},
+	}))
+
+	_, got := findConversationNew(drain(sender))
+	assert.False(t, got, "sender must not receive its own chat:conversation:new")
+}
+
+func TestHandleChatConversationNew_SkipsOfflineRecipient(t *testing.T) {
+	r := newTestRoom()
+	sender := newTestClient(r, "alice", "available")
+	online := newTestClient(r, "bob", "available")
+
+	// "carol" is not connected to this room — must be skipped without affecting bob.
+	r.handleChatConversationNew(sender, encodePayload(ClientChatConversationNotifyPayload{
+		ConversationID:   "conv-new",
+		RecipientUserIDs: []string{"carol", "bob"},
+	}))
+
+	_, ok := findConversationNew(drain(online))
+	assert.True(t, ok, "an online recipient is still notified when another recipient is offline")
+}
+
+func TestHandleChatConversationNew_EmptyConversationID_Error(t *testing.T) {
+	r := newTestRoom()
+	sender := newTestClient(r, "alice", "available")
+
+	r.handleChatConversationNew(sender, encodePayload(ClientChatConversationNotifyPayload{
+		ConversationID:   "",
+		RecipientUserIDs: []string{"bob"},
+	}))
+
+	assert.True(t, hasType(drain(sender), MsgError), "empty conversation_id should error")
+}
+
 // ── dispatch via handleClientMessage (envelope wiring) ─────────────────────────
 
 func TestHandleClientMessage_DispatchesChatEvents(t *testing.T) {
@@ -488,4 +561,20 @@ func TestHandleClientMessage_DispatchesReactionAndTyping(t *testing.T) {
 	msgs := drain(receiver)
 	assert.True(t, hasType(msgs, MsgChatReactionUpdate), "chat:reaction routed via dispatch should relay chat:reaction:update")
 	assert.True(t, hasType(msgs, MsgChatTyping), "chat:typing:start/stop routed via dispatch should relay chat:typing")
+}
+
+func TestHandleClientMessage_DispatchesConversationNotify(t *testing.T) {
+	r := newTestRoom()
+	sender := newTestClient(r, "alice", "available")
+	recipient := newTestClient(r, "bob", "available")
+
+	raw, _ := encode(ClientMsgChatConversationNotify, ClientChatConversationNotifyPayload{
+		ConversationID:   "conv-new",
+		RecipientUserIDs: []string{"bob"},
+	})
+	r.handleClientMessage(sender, raw)
+
+	convID, ok := findConversationNew(drain(recipient))
+	require.True(t, ok, "chat:conversation:notify routed via handleClientMessage should unicast chat:conversation:new")
+	assert.Equal(t, "conv-new", convID)
 }

@@ -36,8 +36,13 @@ const (
 	MsgKnockCancelled  = "knock_cancelled"  // broadcast to room: requester cancelled their knock (dismiss notification on all occupants)
 	MsgCapacityReached  = "capacity_reached"  // unicast: office is full — connection will be closed
 	MsgSessionReplaced  = "session_replaced"  // unicast: another tab/device connected — this connection will close
-	MsgSectionSync      = "section_sync"      // broadcast: section state changed (relay from any client)
-	MsgWaveAnimation   = "wave_animation"   // broadcast: show wave animation on sender's avatar
+	MsgSectionSync       = "section_sync"        // broadcast: section state changed (relay from any client)
+	MsgCircleJoinRequest = "circle_join_request" // broadcast: someone wants to join a circle
+	MsgCircleJoinResult  = "circle_join_result"  // unicast to requester OR broadcast to dismiss
+	MsgCircleLeft        = "circle_left"         // broadcast: a member left a proximity circle (SC-CHAT-03)
+	MsgCircleRejoined    = "circle_rejoined"     // broadcast: a member rejoined within the grace window (SC-CHAT-03)
+	MsgChatSpaceState    = "chat_space_state"    // broadcast: authoritative list of proximity chat sessions (server-owned)
+	MsgWaveAnimation     = "wave_animation"      // broadcast: show wave animation on sender's avatar
 	MsgServerDrain     = "server_drain"     // broadcast: server is shutting down — client should reconnect
 	MsgForceSync       = "force_sync"       // unicast: server corrects the client's position (reconciliation)
 
@@ -54,6 +59,21 @@ const (
 	// the payload, only routes it by conversation_id to the OTHER subscribers.
 	MsgChatReactionUpdate = "chat:reaction:update" // relay: a message's reactions changed
 	MsgChatTyping         = "chat:typing"          // relay: a user started/stopped typing in a conversation
+
+	// MsgChatConversationNew is a per-USER unicast (not a per-conversation relay):
+	// it tells a recipient that a brand-new conversation now includes them so their
+	// client can refetch its conversation list and subscribe. Needed because a first
+	// contact (e.g. a DM to someone who never chatted with the sender) creates a
+	// conversation the recipient has not subscribed to — without this signal the
+	// recipient never learns the conversation exists until a full reload.
+	MsgChatConversationNew = "chat:conversation:new"
+
+	// MsgChatNotificationNew is a per-USER unicast carrying a freshly-created in-app
+	// notification (SC-CHAT-10). Unlike the chat:* relays it does NOT originate from a
+	// client: zyra-api creates the notification row, then publishes it on the Redis
+	// vo:notify channel; this server fans it out to the target user's live connection
+	// so the bell/count update instantly without a REST refetch.
+	MsgChatNotificationNew = "chat:notification:new"
 )
 
 // Envelope is the top-level wrapper for all messages in both directions.
@@ -272,8 +292,12 @@ const (
 	ClientMsgMoveTo       = "move_to" // path-based movement: client sends waypoints, server calculates duration
 	ClientMsgStop         = "stop"    // interrupt current path movement
 	ClientMsgHeartbeat    = "heartbeat"
-	ClientMsgSectionSync  = "section_sync" // client→server→broadcast: notify peers of section state change
-	ClientMsgVisibility   = "visibility"   // client→server: tab hidden/visible (drives server-authoritative follow)
+	ClientMsgSectionSync    = "section_sync"       // client→server→broadcast: notify peers of section state change
+	ClientMsgCircleAskJoin  = "circle_ask_join"    // client asks to join a circle
+	ClientMsgCircleJoinDecide = "circle_join_decide" // circle member accepts/denies
+	ClientMsgCircleLeave    = "circle_leave"       // client left a proximity circle (walk-out) → relay to peers
+	ClientMsgCircleRejoin   = "circle_rejoin"      // client rejoined within the 5s grace window → relay to peers
+	ClientMsgVisibility     = "visibility"         // client→server: tab hidden/visible (drives server-authoritative follow)
 
 	// Chat real-time fan-out (CHAT-006). The client subscribes to specific
 	// conversation_ids and only receives relayed events for those conversations.
@@ -290,6 +314,13 @@ const (
 	ClientMsgChatReaction    = "chat:reaction"      // client→server: relay a message's already-persisted reactions
 	ClientMsgChatTypingStart = "chat:typing:start"  // client→server: relay that the user started typing
 	ClientMsgChatTypingStop  = "chat:typing:stop"   // client→server: relay that the user stopped typing
+
+	// ClientMsgChatConversationNotify is sent by the creator of a new conversation to
+	// announce it to specific recipients. The server unicasts MsgChatConversationNew to
+	// each named recipient that is online in the room (offline ones pick it up via REST
+	// on their next load). Unlike chat:join-based relays this addresses users directly,
+	// so it works for a conversation the recipient has not yet subscribed to.
+	ClientMsgChatConversationNotify = "chat:conversation:notify"
 )
 
 // ClientVisibilityPayload reports the tab's Page-Visibility state.
@@ -436,6 +467,84 @@ type SectionSyncPayload struct {
 	Ended       bool     `json:"ended,omitempty"`
 }
 
+// ── Circle join request/response ──────────────────────────────────────────────
+
+// CircleAskJoinPayload is sent by a non-member wanting to join a proximity circle.
+type CircleAskJoinPayload struct {
+	CircleID string `json:"circle_id"` // e.g. "proximity-user1-user2"
+}
+
+// CircleJoinRequestPayload is broadcast to all clients when someone asks to join a circle.
+type CircleJoinRequestPayload struct {
+	RequestID       string `json:"request_id"`
+	CircleID        string `json:"circle_id"`
+	RequesterUserID string `json:"requester_user_id"`
+	RequesterName   string `json:"requester_name"`
+	RequesterAvatar string `json:"requester_avatar"`
+}
+
+// CircleJoinDecidePayload is sent by a circle member to accept/deny a join request.
+type CircleJoinDecidePayload struct {
+	RequestID       string `json:"request_id"`
+	CircleID        string `json:"circle_id"`
+	Allow           bool   `json:"allow"`
+	RequesterUserID string `json:"requester_user_id"`
+}
+
+// CircleJoinResultPayload is broadcast so all clients can update circle membership.
+// CooldownUntilMs is set when the requester has been denied circleDenyThreshold times
+// — the client should show a countdown and block the Ask button for this duration.
+type CircleJoinResultPayload struct {
+	RequestID       string `json:"request_id"`
+	CircleID        string `json:"circle_id"`
+	Allowed         bool   `json:"allowed"`
+	RequesterUserID string `json:"requester_user_id"`
+	CooldownUntilMs int64  `json:"cooldown_until_ms,omitempty"`
+}
+
+// CircleLeavePayload is sent by a member who walked out of a proximity circle.
+// CircleLeftPayload is the broadcast so remaining members remove the leaver
+// immediately (instead of waiting for position-based detection). SC-CHAT-03.
+type CircleLeavePayload struct {
+	CircleID string `json:"circle_id"`
+}
+
+type CircleLeftPayload struct {
+	CircleID string `json:"circle_id"`
+	UserID   string `json:"user_id"`
+}
+
+// CircleRejoinPayload / CircleRejoinedPayload handle the "return within 5s →
+// rejoin the same session" rule: the returning member broadcasts a rejoin and
+// remaining members re-add them without a fresh Ask-to-Join approval. SC-CHAT-03.
+type CircleRejoinPayload struct {
+	CircleID string `json:"circle_id"`
+}
+
+type CircleRejoinedPayload struct {
+	CircleID string `json:"circle_id"`
+	UserID   string `json:"user_id"`
+}
+
+// ── Chat-space sessions (server-authoritative) ────────────────────────────────
+//
+// The hub owns proximity-chat membership and broadcasts the full session list
+// whenever it changes. Clients RENDER this verbatim — they no longer compute
+// clusters locally, so every viewer sees an identical set of circles. The viewer
+// derives its own colour (green = I'm a member, white = someone else's, red =
+// full) from this shared truth.
+
+// ChatSpaceSessionDTO is one authoritative session in a MsgChatSpaceState payload.
+type ChatSpaceSessionDTO struct {
+	ID        string   `json:"id"`
+	MemberIDs []string `json:"member_ids"`
+}
+
+// ChatSpaceStatePayload is the full list of active proximity-chat sessions.
+type ChatSpaceStatePayload struct {
+	Sessions []ChatSpaceSessionDTO `json:"sessions"`
+}
+
 // ── Chat real-time fan-out (CHAT-006) ─────────────────────────────────────────
 //
 // The WS server is a pure relay: messages are persisted via REST in zyra-api and
@@ -535,6 +644,32 @@ type ChatTypingPayload struct {
 	ConversationID string          `json:"conversation_id"`
 	User           json.RawMessage `json:"user"`
 	Typing         bool            `json:"typing"`
+}
+
+// ── New-conversation announce (first-contact delivery) ────────────────────────
+//
+// Per-USER unicast, not a per-conversation relay: the creator names the recipients
+// directly so a conversation the recipient hasn't subscribed to still reaches them.
+
+// ClientChatConversationNotifyPayload announces a new conversation to the given
+// recipients so each online recipient can refetch its conversation list and subscribe.
+type ClientChatConversationNotifyPayload struct {
+	ConversationID   string   `json:"conversation_id"`
+	RecipientUserIDs []string `json:"recipient_user_ids"`
+}
+
+// ChatConversationNewPayload is the OUTBOUND unicast (chat:conversation:new) telling a
+// recipient a new conversation includes them. It carries only the id — the client
+// refetches the conversation (viewer-relative) over REST.
+type ChatConversationNewPayload struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+// ChatNotificationNewPayload is the OUTBOUND unicast (chat:notification:new). The
+// notification blob is the verbatim model.Notification JSON produced by zyra-api and
+// forwarded opaquely — this server never inspects it.
+type ChatNotificationNewPayload struct {
+	Notification json.RawMessage `json:"notification"`
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

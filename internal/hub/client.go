@@ -35,15 +35,21 @@ type Client struct {
 	DisplayName   string
 	CharacterName string
 	AvatarURL     string
-	TileX         int
-	TileY         int
-	PX            float64 // world pixel X (sprite centre) — 0 = not yet set
-	PY            float64 // world pixel Y (sprite centre) — 0 = not yet set
-	Status        string
-	CustomMsg     string
-	RoomID        string
-	Direction     string
-	Sitting       bool
+	// ClientSessionID is a stable id unique to the browser tab that opened this
+	// connection (sent as the client_session_id query param). It lets register
+	// tell a genuine second tab/device apart from the same tab reconnecting, so
+	// "Session Active Elsewhere" only fires for the former. Empty for legacy
+	// clients that don't send it.
+	ClientSessionID string
+	TileX           int
+	TileY           int
+	PX              float64 // world pixel X (sprite centre) — 0 = not yet set
+	PY              float64 // world pixel Y (sprite centre) — 0 = not yet set
+	Status          string
+	CustomMsg       string
+	RoomID          string
+	Direction       string
+	Sitting         bool
 	// Follow chain (doubly-linked list). The chain is a single line:
 	//   Leader <- F1 <- F2 <- F3(tail)   (new followers append at the tail)
 	// FollowTargetID = the node directly AHEAD (the one this client walks behind).

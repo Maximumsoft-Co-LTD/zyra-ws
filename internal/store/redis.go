@@ -510,6 +510,35 @@ func (s *RedisStore) DeletePosSnapshot(ctx context.Context, wsID, userID string)
 	return s.rdb.HDel(ctx, posSnapKey(wsID), userID).Err()
 }
 
+// ── Chat-space sessions (server-authoritative proximity chat) ────────────────
+
+func chatSessKey(wsID string) string {
+	return fmt.Sprintf("vo:chatspace:%s", wsID)
+}
+
+// SaveChatSessions write-throughs the authoritative session list (JSON-encoded
+// []ChatSpaceSessionDTO) so it survives a hub restart and is visible to other
+// instances. Best-effort: sessions self-heal from live positions if absent.
+func (s *RedisStore) SaveChatSessions(ctx context.Context, wsID string, data []byte) error {
+	if !s.available() {
+		return nil
+	}
+	return s.rdb.Set(ctx, chatSessKey(wsID), data, presenceTTL).Err()
+}
+
+// GetChatSessions returns the persisted session list JSON for a workspace, or an
+// empty string if none is stored.
+func (s *RedisStore) GetChatSessions(ctx context.Context, wsID string) (string, error) {
+	if !s.available() {
+		return "", nil
+	}
+	v, err := s.rdb.Get(ctx, chatSessKey(wsID)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return v, err
+}
+
 // ── Obstacle grid (movement validation) ───────────────────────────────────────
 
 // obstacleKey mirrors the key written by zyra-api at publish time.
@@ -567,6 +596,49 @@ func (s *RedisStore) GetWorkspaceObstacles(ctx context.Context, wsID string) (*O
 		grid.Walls = make(map[string]string)
 	}
 	return grid, nil
+}
+
+// ── Notification push (SC-CHAT-10) ────────────────────────────────────────────
+
+// notifyChannel is the Redis pub/sub channel zyra-api publishes freshly-created
+// in-app notifications on; this server subscribes and fans each out to the target
+// user's live connection. Must match cache.notifyChannel in zyra-api.
+const notifyChannel = "vo:notify"
+
+// NotificationPush is one decoded message off the vo:notify channel: the workspace
+// room + target user to deliver to, plus the verbatim model.Notification JSON.
+type NotificationPush struct {
+	WorkspaceID  string          `json:"workspace_id"`
+	UserID       string          `json:"user_id"`
+	Notification json.RawMessage `json:"notification"`
+}
+
+// SubscribeNotifications subscribes to the vo:notify channel and streams decoded
+// pushes on the returned channel until ctx is cancelled or the returned closer is
+// called. Returns a closed channel + no-op closer when Redis is unavailable, so the
+// caller never blocks. Malformed messages are skipped.
+func (s *RedisStore) SubscribeNotifications(ctx context.Context) (<-chan NotificationPush, func() error) {
+	out := make(chan NotificationPush, 64)
+	if !s.available() {
+		close(out)
+		return out, func() error { return nil }
+	}
+	pubsub := s.rdb.Subscribe(ctx, notifyChannel)
+	go func() {
+		defer close(out)
+		for msg := range pubsub.Channel() {
+			var p NotificationPush
+			if err := json.Unmarshal([]byte(msg.Payload), &p); err != nil {
+				continue
+			}
+			select {
+			case out <- p:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return out, pubsub.Close
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
